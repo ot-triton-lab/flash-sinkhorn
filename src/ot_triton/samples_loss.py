@@ -5,32 +5,19 @@ from typing import Optional, Sequence, Tuple, Union
 
 import torch
 
-from ot_triton.hvp import geomloss_to_ott_potentials
+from ot_triton.hvp import geomloss_to_ott_potentials, ott_to_geomloss_potentials
 from ot_triton.hvp import hvp_x_sqeuclid_from_potentials
-from ot_triton.hvp import hvp_x_sqeuclid_from_potentials_taskcsr
 from ot_triton.kernels.sinkhorn_triton_geomloss_sqeuclid import (
-    _default_block_sizes as _dense_default_block_sizes,
     epsilon_schedule,
     log_weights,
     max_diameter,
     sinkhorn_geomloss_online_potentials_sqeuclid,
 )
-from ot_triton.kernels.sinkhorn_triton_geomloss_multiscale_sqeuclid import (
-    sinkhorn_geomloss_multiscale_potentials_sqeuclid,
-)
-from ot_triton.kernels.sinkhorn_triton_geomloss_blocksparse_ranges_sqeuclid import (
-    blocksparse_build_tasks_from_csr,
-)
-from ot_triton.kernels.sinkhorn_triton_geomloss_blocksparse_sqeuclid import (
-    blocksparse_prepare_metadata,
-    geomloss_blocksparse_grad_sqeuclid,
-)
-from ot_triton.kernels.sinkhorn_triton_geomloss_blocksparse_taskcsr_sqeuclid import (
-    blocksparse_build_taskcsr,
-    blocksparse_build_taskcsr_buckets,
-)
 from ot_triton.kernels.sinkhorn_triton_grad_sqeuclid import (
     sinkhorn_geomloss_online_grad_sqeuclid,
+)
+from ot_triton.kernels.sinkhorn_triton_ott_sqeuclid import (
+    sinkhorn_potentials_sqeuclid as sinkhorn_ott_potentials_sqeuclid,
 )
 
 
@@ -64,6 +51,9 @@ class _SinkhornGradFn(torch.autograd.Function):
         hvp_use_preconditioner: bool,
         compute_grad_x: bool,
         compute_grad_y: bool,
+        rho_x: Optional[float] = None,  # For semi-unbalanced OT HVP
+        rho_y: Optional[float] = None,  # For semi-unbalanced OT HVP
+        cost_scale: float = 1.0,  # Cost scaling: 1.0 for full, 0.5 for half
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         gx, gy = sinkhorn_geomloss_online_grad_sqeuclid(
             x,
@@ -84,6 +74,13 @@ class _SinkhornGradFn(torch.autograd.Function):
             grad_scale=grad_scale,
             compute_grad_x=bool(compute_grad_x),
             compute_grad_y=bool(compute_grad_y),
+            cost_scale=float(cost_scale),
+            # Label cost disabled in public release
+            label_x=None,
+            label_y=None,
+            label_cost_matrix=None,
+            lambda_x=1.0,
+            lambda_y=0.0,
         )
 
         ctx.save_for_backward(x, y, a, b, f_grad, g_grad, grad_scale)
@@ -104,6 +101,9 @@ class _SinkhornGradFn(torch.autograd.Function):
         ctx.hvp_preconditioner = str(hvp_preconditioner)
         ctx.hvp_precond_terms = int(hvp_precond_terms)
         ctx.hvp_use_preconditioner = bool(hvp_use_preconditioner)
+        ctx.rho_x = rho_x  # For semi-unbalanced OT HVP
+        ctx.rho_y = rho_y  # For semi-unbalanced OT HVP
+        ctx.cost_scale = float(cost_scale)  # For HVP
         return gx, gy
 
     @staticmethod
@@ -132,6 +132,9 @@ class _SinkhornGradFn(torch.autograd.Function):
                 g_hat,
                 grad_grad_x,
                 eps=ctx.eps,
+                rho_x=ctx.rho_x,  # For semi-unbalanced OT HVP
+                rho_y=ctx.rho_y,  # For semi-unbalanced OT HVP
+                cost_scale=ctx.cost_scale,  # Cost scaling for half cost
                 tau2=ctx.hvp_tau2,
                 max_cg_iter=ctx.hvp_max_cg_iter,
                 cg_rtol=ctx.hvp_cg_rtol,
@@ -140,7 +143,7 @@ class _SinkhornGradFn(torch.autograd.Function):
                 preconditioner=ctx.hvp_preconditioner,
                 precond_terms=ctx.hvp_precond_terms,
                 use_preconditioner=ctx.hvp_use_preconditioner,
-                allow_tf32=ctx.allow_tf32,
+                allow_tf32=False,  # HVP requires full fp32 precision, TF32 causes numerical instability
                 use_exp2=ctx.use_exp2,
                 block_m=ctx.block_m,
                 block_n=ctx.block_n,
@@ -153,7 +156,8 @@ class _SinkhornGradFn(torch.autograd.Function):
         # Inputs: x,y,a,b,f_grad,g_grad,eps,allow_tf32,use_exp2,autotune,
         # block_m,block_n,block_k,num_warps,num_stages,grad_scale,
         # hvp_tau2,hvp_max_cg_iter,hvp_cg_rtol,hvp_cg_atol,hvp_cg_stabilise_every,hvp_preconditioner,hvp_precond_terms,hvp_use_preconditioner,
-        # compute_grad_x, compute_grad_y
+        # compute_grad_x, compute_grad_y, rho_x, rho_y, cost_scale,
+        # label_x, label_y, label_cost_matrix, lambda_x, lambda_y
         return (
             out_x,
             None,
@@ -181,290 +185,14 @@ class _SinkhornGradFn(torch.autograd.Function):
             None,
             None,
             None,
-        )
-
-
-class _SinkhornGradFnMultiscale(torch.autograd.Function):
-    @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        f_grad: torch.Tensor,
-        g_grad: torch.Tensor,
-        perm_x: torch.Tensor,
-        perm_y: torch.Tensor,
-        offsets_x: torch.Tensor,
-        offsets_y: torch.Tensor,
-        row_ptr_x: torch.Tensor,
-        col_idx_x: torch.Tensor,
-        row_ptr_y: torch.Tensor,
-        col_idx_y: torch.Tensor,
-        eps: float,
-        allow_tf32: bool,
-        use_exp2: bool,
-        block_m: int,
-        block_n: int,
-        block_k: int,
-        num_warps: int,
-        num_stages: int,
-        grad_scale: torch.Tensor,
-        hvp_tau2: float,
-        hvp_max_cg_iter: int,
-        hvp_cg_rtol: float,
-        hvp_cg_atol: float,
-        hvp_cg_stabilise_every: int,
-        hvp_preconditioner: str,
-        hvp_precond_terms: int,
-        hvp_use_preconditioner: bool,
-        multiscale_blocksparse_backend: str,
-        compute_grad_x: bool,
-        compute_grad_y: bool,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        (
-            pid_x_cluster,
-            pid_x_block,
-            pid_y_cluster,
-            pid_y_block,
-            max_blocks_x,
-            max_blocks_y,
-            max_deg_x,
-            max_deg_y,
-        ) = blocksparse_prepare_metadata(
-            offsets_x=offsets_x,
-            offsets_y=offsets_y,
-            row_ptr_x=row_ptr_x,
-            row_ptr_y=row_ptr_y,
-            block_m=int(block_m),
-            block_n=int(block_n),
-        )
-
-        x_s = x[perm_x]
-        y_s = y[perm_y]
-        a_s = a[perm_x].float().contiguous()
-        b_s = b[perm_y].float().contiguous()
-        f_s = f_grad[perm_x].float().contiguous()
-        g_s = g_grad[perm_y].float().contiguous()
-        x2_s = (x_s.float() * x_s.float()).sum(dim=1).contiguous()
-        y2_s = (y_s.float() * y_s.float()).sum(dim=1).contiguous()
-        loga_s = log_weights(a_s).contiguous()
-        logb_s = log_weights(b_s).contiguous()
-
-        gx_s, gy_s = geomloss_blocksparse_grad_sqeuclid(
-            x_s,
-            y_s,
-            a_s,
-            b_s,
-            f_s,
-            g_s,
-            loga_s,
-            logb_s,
-            x2_s,
-            y2_s,
-            offsets_x=offsets_x,
-            offsets_y=offsets_y,
-            row_ptr_x=row_ptr_x,
-            col_idx_x=col_idx_x,
-            row_ptr_y=row_ptr_y,
-            col_idx_y=col_idx_y,
-            eps=float(eps),
-            grad_scale=grad_scale,
-            pid_x_cluster=pid_x_cluster,
-            pid_x_block=pid_x_block,
-            pid_y_cluster=pid_y_cluster,
-            pid_y_block=pid_y_block,
-            max_blocks_x=max_blocks_x,
-            max_blocks_y=max_blocks_y,
-            max_deg_x=max_deg_x,
-            max_deg_y=max_deg_y,
-            block_m=int(block_m),
-            block_n=int(block_n),
-            block_k=int(block_k),
-            num_warps=int(num_warps),
-            num_stages=int(num_stages),
-            allow_tf32=bool(allow_tf32),
-            use_exp2=bool(use_exp2),
-            compute_grad_x=bool(compute_grad_x),
-            compute_grad_y=bool(compute_grad_y),
-        )
-
-        gx = None
-        if gx_s is not None:
-            gx = torch.empty_like(x, dtype=torch.float32)
-            gx[perm_x] = gx_s
-        gy = None
-        if gy_s is not None:
-            gy = torch.empty_like(y, dtype=torch.float32)
-            gy[perm_y] = gy_s
-
-        ctx.save_for_backward(
-            x,
-            y,
-            a,
-            b,
-            f_grad,
-            g_grad,
-            perm_x,
-            perm_y,
-            offsets_x,
-            offsets_y,
-            row_ptr_x,
-            col_idx_x,
-            row_ptr_y,
-            col_idx_y,
-            grad_scale,
-        )
-        ctx.eps = float(eps)
-        ctx.allow_tf32 = bool(allow_tf32)
-        ctx.use_exp2 = bool(use_exp2)
-        ctx.block_m = int(block_m)
-        ctx.block_n = int(block_n)
-        ctx.num_warps = int(num_warps)
-        ctx.num_stages = int(num_stages)
-        ctx.hvp_tau2 = float(hvp_tau2)
-        ctx.hvp_max_cg_iter = int(hvp_max_cg_iter)
-        ctx.hvp_cg_rtol = float(hvp_cg_rtol)
-        ctx.hvp_cg_atol = float(hvp_cg_atol)
-        ctx.hvp_cg_stabilise_every = int(hvp_cg_stabilise_every)
-        ctx.hvp_preconditioner = str(hvp_preconditioner)
-        ctx.hvp_precond_terms = int(hvp_precond_terms)
-        ctx.hvp_use_preconditioner = bool(hvp_use_preconditioner)
-        ctx.multiscale_blocksparse_backend = str(multiscale_blocksparse_backend)
-        return gx, gy
-
-    @staticmethod
-    def backward(  # type: ignore[override]
-        ctx, grad_grad_x: Optional[torch.Tensor], grad_grad_y: Optional[torch.Tensor]
-    ):
-        (
-            x,
-            y,
-            a,
-            b,
-            f_grad,
-            g_grad,
-            perm_x,
-            perm_y,
-            offsets_x,
-            offsets_y,
-            row_ptr_x,
-            col_idx_x,
-            row_ptr_y,
-            col_idx_y,
-            grad_scale,
-        ) = ctx.saved_tensors
-
-        if grad_grad_y is not None:
-            raise NotImplementedError("Double backward w.r.t y is not implemented yet.")
-
-        out_x = None
-        if grad_grad_x is not None:
-            if grad_grad_x.shape != x.shape:
-                raise ValueError("grad_grad_x must have the same shape as x.")
-            if not grad_grad_x.is_cuda:
-                raise ValueError("grad_grad_x must be a CUDA tensor.")
-
-            x_s = x[perm_x].contiguous()
-            y_s = y[perm_y].contiguous()
-            a_s = a[perm_x].float().contiguous()
-            b_s = b[perm_y].float().contiguous()
-            f_s = f_grad[perm_x].float().contiguous()
-            g_s = g_grad[perm_y].float().contiguous()
-            A_s = grad_grad_x[perm_x].contiguous()
-
-            f_hat, g_hat = geomloss_to_ott_potentials(f_s, g_s, a_s, b_s, eps=ctx.eps)
-
-            tasks = blocksparse_build_tasks_from_csr(
-                offsets_x=offsets_x,
-                offsets_y=offsets_y,
-                row_ptr_x=row_ptr_x,
-                col_idx_x=col_idx_x,
-                block_m=int(ctx.block_m),
-                block_n=int(ctx.block_n),
-            )
-            taskcsr_x = blocksparse_build_taskcsr(tasks, by="x")
-            taskcsr_y = blocksparse_build_taskcsr(tasks, by="y")
-
-            buckets = None
-            backend = ctx.multiscale_blocksparse_backend
-            if backend == "auto":
-                backend = "taskcsr_bucketed"
-            if backend == "taskcsr_bucketed":
-                buckets = blocksparse_build_taskcsr_buckets(taskcsr_x, taskcsr_y)
-
-            hvp_s, _ = hvp_x_sqeuclid_from_potentials_taskcsr(
-                x_s,
-                y_s,
-                f_hat,
-                g_hat,
-                A_s,
-                eps=ctx.eps,
-                offsets_x=offsets_x,
-                offsets_y=offsets_y,
-                taskcsr_x=taskcsr_x,
-                taskcsr_y=taskcsr_y,
-                buckets=buckets,
-                tau2=ctx.hvp_tau2,
-                max_cg_iter=ctx.hvp_max_cg_iter,
-                cg_rtol=ctx.hvp_cg_rtol,
-                cg_atol=ctx.hvp_cg_atol,
-                cg_stabilise_every=ctx.hvp_cg_stabilise_every,
-                preconditioner=ctx.hvp_preconditioner,
-                precond_terms=ctx.hvp_precond_terms,
-                use_preconditioner=ctx.hvp_use_preconditioner,
-                block_m=int(ctx.block_m),
-                block_n=int(ctx.block_n),
-                num_warps=int(ctx.num_warps),
-                num_stages=int(ctx.num_stages),
-                use_exp2=bool(ctx.use_exp2),
-            )
-
-            out_x = torch.empty_like(x, dtype=torch.float32)
-            out_x[perm_x] = hvp_s
-            out_x = out_x * grad_scale
-
-        # Inputs:
-        # x,y,a,b,f_grad,g_grad,perm_x,perm_y,offsets_x,offsets_y,row_ptr_x,col_idx_x,row_ptr_y,col_idx_y,
-        # eps,allow_tf32,use_exp2,block_m,block_n,block_k,num_warps,num_stages,grad_scale,
-        # hvp_tau2,hvp_max_cg_iter,hvp_cg_rtol,hvp_cg_atol,hvp_cg_stabilise_every,hvp_preconditioner,hvp_precond_terms,hvp_use_preconditioner,
-        # multiscale_blocksparse_backend,compute_grad_x,compute_grad_y
-        return (
-            out_x,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # rho_x
+            None,  # rho_y
+            None,  # cost_scale
+            None,  # label_x
+            None,  # label_y
+            None,  # label_cost_matrix
+            None,  # lambda_x
+            None,  # lambda_y
         )
 
 
@@ -488,10 +216,25 @@ def _as_float_tensor(x: torch.Tensor) -> torch.Tensor:
 
 
 def _normalize_weights(w: torch.Tensor, *, eps: float = 0.0) -> torch.Tensor:
+    """Normalize weights to sum to 1 along the last dimension.
+
+    Args:
+        w: Input weights tensor
+        eps: Small value to add to weights before normalization (for stability)
+
+    Returns:
+        Normalized weights (sum to 1 along last dimension)
+
+    Note:
+        Uses a small clamp (1e-40) on the sum to avoid division by zero
+        when all weights are zero. This is a defensive guard for edge cases.
+    """
     w = w.float()
     if eps > 0:
         w = w + eps
     z = w.sum(dim=-1, keepdim=True)
+    # Clamp to avoid division by zero when all weights are zero
+    z = z.clamp(min=1e-40)
     return w / z
 
 
@@ -621,22 +364,39 @@ class SamplesLoss(torch.nn.Module):
 
     This is a minimal, CUDA-only subset of GeomLoss's `SamplesLoss`:
     - `loss` must be "sinkhorn".
-    - Only squared Euclidean ground cost is supported.
-    - Only the balanced (reach=None) setting is supported.
+    - Only squared Euclidean ground cost is supported (with optional label cost).
+    - Supports balanced, unbalanced, and semi-unbalanced OT.
 
-    The implementation uses a GeomLoss-style symmetric Sinkhorn loop
-    (`sinkhorn_geomloss_online_potentials_sqeuclid`) and returns either:
+    Two backends are available:
+    - `backend="symmetric"` (default): GeomLoss-style symmetric Sinkhorn loop (Jacobi).
+      Supports all features: debiasing, unbalanced OT, epsilon scaling, label cost.
+    - `backend="alternating"`: OTT-JAX-style alternating Sinkhorn loop (Gauss-Seidel).
+      Matches OTT-JAX's `update_potential` exactly. Requires fixed eps and n_iters.
+      Does NOT support: debiasing, unbalanced OT, epsilon scaling, or label cost.
+
+    The implementation returns either:
     - a scalar OT cost (default), or
     - a pair of potentials (f, g) when `potentials=True`.
+
+    Unbalanced and Semi-Unbalanced OT
+    ---------------------------------
+    Control marginal relaxation via `reach`, `reach_x`, and `reach_y` parameters.
+    The marginal penalty strength is rho = reach^2 (for squared Euclidean cost, p=2).
+
+    - reach=None (or reach_x=reach_y=None): Balanced OT (strict marginal constraints)
+    - reach>0: Unbalanced OT with equal relaxation on both marginals
+    - reach_x>0, reach_y=None: Semi-unbalanced OT (relax source, strict target)
+    - reach_x=None, reach_y>0: Semi-unbalanced OT (strict source, relax target)
+    - reach_x>0, reach_y>0: Fully asymmetric unbalanced OT
+
+    Semi-unbalanced OT is useful when one distribution is trusted (e.g., a fixed
+    reference) while the other may have mass differences or outliers.
 
     Notes
     -----
     - Gradients are computed analytically (no backprop through Sinkhorn iterations),
       matching GeomLoss's `last_extrapolation` convention.
     - `potentials=True` returns (f, g) without autograd support.
-    - For `backend="multiscale"`, `multiscale_blocksparse_backend` selects the fine-level
-      sparse reduction layout: `auto` (heuristic), `padded`, `taskcsr`,
-      `taskcsr_bucketed` (degree-bucketed task-CSR), or `ranges_atomic`.
     """
 
     def __init__(
@@ -645,20 +405,20 @@ class SamplesLoss(torch.nn.Module):
         *,
         p: int = 2,
         blur: float = 0.05,
+        reach: Optional[float] = None,
+        reach_x: Optional[float] = None,
+        reach_y: Optional[float] = None,
         scaling: float = 0.5,
         debias: bool = False,
         potentials: bool = False,
-        backend: str = "online",
+        backend: str = "symmetric",
         normalize: bool = True,
         use_epsilon_scaling: bool = True,
         last_extrapolation: bool = True,
-        truncate: float = 5.0,
-        cluster_scale: Optional[float] = None,
-        max_coarse_levels: int = 1,
-        multiscale_blocksparse_backend: str = "auto",
         allow_tf32: bool = True,
         use_exp2: bool = True,
         autotune: bool = True,
+        half_cost: bool = False,
         eps: Optional[float] = None,
         n_iters: Optional[int] = None,
         diameter: Optional[float] = None,
@@ -676,6 +436,9 @@ class SamplesLoss(torch.nn.Module):
         hvp_preconditioner: str = "none",
         hvp_precond_terms: int = 3,
         hvp_use_preconditioner: bool = True,
+        # Early stopping parameters (like OTT-JAX)
+        threshold: Optional[float] = None,  # Convergence threshold (None = no early stopping)
+        inner_iterations: int = 10,  # Check convergence every N iterations (like OTT-JAX)
     ):
         super().__init__()
 
@@ -683,30 +446,65 @@ class SamplesLoss(torch.nn.Module):
             raise ValueError('Only loss="sinkhorn" is supported.')
         if p != 2:
             raise ValueError("Only p=2 (squared Euclidean cost) is supported.")
-        if debias:
-            raise NotImplementedError(
-                "Debiased Sinkhorn divergence is not implemented in ot_triton yet. "
-                "Use debias=False." 
-            )
-        if backend not in ("online", "triton", "multiscale", "auto"):
+        # Debiasing is now supported
+        if backend not in ("symmetric", "alternating", "triton", "auto"):
             raise ValueError(
-                'Only backend in {"online","triton","multiscale","auto"} is supported.'
+                'Only backend in {"symmetric","alternating","triton","auto"} is supported.'
             )
-        if multiscale_blocksparse_backend not in (
-            "auto",
-            "padded",
-            "ranges_atomic",
-            "taskcsr",
-            "taskcsr_bucketed",
-        ):
-            raise ValueError(
-                "multiscale_blocksparse_backend must be one of "
-                "{'auto','padded','ranges_atomic','taskcsr','taskcsr_bucketed'}."
-            )
+        # OTT backend requires specific settings
+        if backend == "alternating":
+            if use_epsilon_scaling:
+                raise ValueError(
+                    'backend="alternating" requires use_epsilon_scaling=False. '
+                    'Provide fixed eps and n_iters instead.'
+                )
+            if eps is None or n_iters is None:
+                raise ValueError(
+                    'backend="alternating" requires eps and n_iters to be specified.'
+                )
+            if debias:
+                raise ValueError(
+                    'backend="alternating" does not support debias=True. '
+                    'Use backend="symmetric" for debiased Sinkhorn.'
+                )
+            if reach is not None or reach_x is not None or reach_y is not None:
+                raise ValueError(
+                    'backend="alternating" does not support unbalanced OT. '
+                    'Use backend="symmetric" for unbalanced/semi-unbalanced OT.'
+                )
+        # Validate reach parameters
+        if reach is not None and reach <= 0:
+            raise ValueError("reach must be positive (or None for balanced OT).")
+        if reach_x is not None and reach_x <= 0:
+            raise ValueError("reach_x must be positive (or None for balanced source).")
+        if reach_y is not None and reach_y <= 0:
+            raise ValueError("reach_y must be positive (or None for balanced target).")
+
+        # Handle reach → reach_x/reach_y conversion (legacy API compatibility)
+        if reach is not None:
+            if reach_x is None:
+                reach_x = reach
+            if reach_y is None:
+                reach_y = reach
+
+        # Check unbalanced compatibility
+        is_unbalanced = reach_x is not None or reach_y is not None
 
         self.loss = loss
         self.p = p
         self.blur = float(blur)
+        # Support semi-unbalanced OT with separate reach_x/reach_y
+        self.reach_x = None if reach_x is None else float(reach_x)
+        self.reach_y = None if reach_y is None else float(reach_y)
+        self.rho_x = None if reach_x is None else float(reach_x) ** 2  # rho_x = reach_x^p
+        self.rho_y = None if reach_y is None else float(reach_y) ** 2  # rho_y = reach_y^p
+        # Legacy: self.reach/self.rho for backward compatibility (only if symmetric)
+        if reach_x == reach_y:
+            self.reach = self.reach_x
+            self.rho = self.rho_x
+        else:
+            self.reach = None  # Semi-unbalanced: no single reach
+            self.rho = None
         self.scaling = float(scaling)
         self.debias = bool(debias)
         self.potentials = bool(potentials)
@@ -715,13 +513,11 @@ class SamplesLoss(torch.nn.Module):
 
         self.use_epsilon_scaling = bool(use_epsilon_scaling)
         self.last_extrapolation = bool(last_extrapolation)
-        self.truncate = float(truncate)
-        self.cluster_scale = None if cluster_scale is None else float(cluster_scale)
-        self.max_coarse_levels = int(max_coarse_levels)
-        self.multiscale_blocksparse_backend = str(multiscale_blocksparse_backend)
         self.allow_tf32 = bool(allow_tf32)
         self.use_exp2 = bool(use_exp2)
         self.autotune = bool(autotune)
+        self.half_cost = bool(half_cost)
+        self.cost_scale = 0.5 if half_cost else 1.0
 
         self.eps = None if eps is None else float(eps)
         self.n_iters = None if n_iters is None else int(n_iters)
@@ -742,6 +538,15 @@ class SamplesLoss(torch.nn.Module):
         self.hvp_preconditioner = str(hvp_preconditioner)
         self.hvp_precond_terms = int(hvp_precond_terms)
         self.hvp_use_preconditioner = bool(hvp_use_preconditioner)
+
+        # Label cost disabled in public release (hardcoded defaults)
+        self.label_cost_matrix = None
+        self.lambda_x = 1.0
+        self.lambda_y = 0.0
+
+        # Early stopping (like OTT-JAX)
+        self.threshold = None if threshold is None else float(threshold)
+        self.inner_iterations = int(inner_iterations)
 
     def _eps_list_for_inputs(self, x: torch.Tensor, y: torch.Tensor) -> Sequence[float]:
         if self.eps_list is not None:
@@ -770,6 +575,10 @@ class SamplesLoss(torch.nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         parsed = _process_args(*args, normalize=self.normalize)
 
+        # Label tensors disabled in public release
+        _label_x = None
+        _label_y = None
+
         if not parsed.x.is_cuda or not parsed.y.is_cuda:
             raise ValueError("ot_triton.SamplesLoss requires CUDA tensors.")
 
@@ -792,279 +601,216 @@ class SamplesLoss(torch.nn.Module):
                 num_warps: Optional[int],
                 num_stages: int,
             ) -> torch.Tensor:
-                backend = self.backend
-                if backend == "auto":
-                    if x.shape[1] <= 3 and x.shape[0] * y.shape[0] > 10000**2:
-                        backend = "multiscale"
-                    else:
-                        backend = "online"
-                if last_extrapolation:
-                    if backend == "multiscale":
-                        (
-                            f_cost,
-                            g_cost,
-                            f_grad,
-                            g_grad,
-                            state,
-                        ) = sinkhorn_geomloss_multiscale_potentials_sqeuclid(
-                            x,
-                            y,
-                            a,
-                            b,
-                            blur=self.blur,
-                            scaling=self.scaling,
-                            use_epsilon_scaling=False,
-                            last_extrapolation=True,
-                            allow_tf32=allow_tf32,
-                            use_exp2=use_exp2,
-                            eps=None,
-                            n_iters=None,
-                            diameter=None,
-                            eps_list=eps_list,
-                            truncate=self.truncate,
-                            cluster_scale=self.cluster_scale,
-                            max_coarse_levels=self.max_coarse_levels,
-                            blocksparse_backend=self.multiscale_blocksparse_backend,
-                            block_m=block_m,
-                            block_n=block_n,
-                            block_k=block_k,
-                            num_warps=num_warps,
-                            num_stages=num_stages,
-                            autotune=autotune,
-                            return_prelast=True,
-                            return_state=True,
-                        )
-                    else:
-                        f_cost, g_cost, f_grad, g_grad = sinkhorn_geomloss_online_potentials_sqeuclid(
-                            x,
-                            y,
-                            a,
-                            b,
-                            blur=self.blur,
-                            scaling=self.scaling,
-                            use_epsilon_scaling=False,
-                            last_extrapolation=True,
-                            allow_tf32=allow_tf32,
-                            use_exp2=use_exp2,
-                            eps=None,
-                            n_iters=None,
-                            diameter=None,
-                            eps_list=eps_list,
-                            block_m=block_m,
-                            block_n=block_n,
-                            block_k=block_k,
-                            num_warps=num_warps,
-                            num_stages=num_stages,
-                            autotune=autotune,
-                            return_prelast=True,
-                        )
-                else:
-                    if backend == "multiscale":
-                        (
-                            f_cost,
-                            g_cost,
-                            f_grad,
-                            g_grad,
-                            state,
-                        ) = sinkhorn_geomloss_multiscale_potentials_sqeuclid(
-                            x,
-                            y,
-                            a,
-                            b,
-                            blur=self.blur,
-                            scaling=self.scaling,
-                            use_epsilon_scaling=False,
-                            last_extrapolation=False,
-                            allow_tf32=allow_tf32,
-                            use_exp2=use_exp2,
-                            eps=None,
-                            n_iters=None,
-                            diameter=None,
-                            eps_list=eps_list,
-                            truncate=self.truncate,
-                            cluster_scale=self.cluster_scale,
-                            max_coarse_levels=self.max_coarse_levels,
-                            blocksparse_backend=self.multiscale_blocksparse_backend,
-                            block_m=block_m,
-                            block_n=block_n,
-                            block_k=block_k,
-                            num_warps=num_warps,
-                            num_stages=num_stages,
-                            autotune=autotune,
-                            return_prelast=True,
-                            return_state=True,
-                        )
-                    else:
-                        f_cost, g_cost = sinkhorn_geomloss_online_potentials_sqeuclid(
-                            x,
-                            y,
-                            a,
-                            b,
-                            blur=self.blur,
-                            scaling=self.scaling,
-                            use_epsilon_scaling=False,
-                            last_extrapolation=False,
-                            allow_tf32=allow_tf32,
-                            use_exp2=use_exp2,
-                            eps=None,
-                            n_iters=None,
-                            diameter=None,
-                            eps_list=eps_list,
-                            block_m=block_m,
-                            block_n=block_n,
-                            block_k=block_k,
-                            num_warps=num_warps,
-                            num_stages=num_stages,
-                            autotune=autotune,
-                        )
-                    if backend != "multiscale":
-                        f_grad, g_grad = f_cost, g_cost
+                # OTT backend: use alternating-update Sinkhorn (matches OTT-JAX)
+                if self.backend == "alternating":
+                    loga = log_weights(a).contiguous()
+                    logb = log_weights(b).contiguous()
+                    eps = float(eps_list[-1])  # Fixed eps for OTT backend
+                    n_iters = len(eps_list)
 
-                if backend == "multiscale":
-                    perm_x, perm_y, offsets_x, offsets_y, row_ptr_x, col_idx_x, row_ptr_y, col_idx_y = state
-                    ctx.save_for_backward(
+                    f_cost, g_cost = sinkhorn_ott_potentials_sqeuclid(
+                        x,
+                        y,
+                        loga,
+                        logb,
+                        eps,
+                        n_iters,
+                        autotune=autotune,
+                        allow_tf32=allow_tf32,
+                        use_exp2=use_exp2,
+                        block_m=block_m,
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                    )
+                    # CRITICAL: Convert OTT potentials to GeomLoss convention for gradient kernel.
+                    # OTT potentials: f_ott = eps*log(a) - LSE, g_ott = eps*log(b) - LSE
+                    # GeomLoss gradient kernel expects: f_geo, g_geo (without marginal weights baked in)
+                    # The kernel computes: exp((g - C)/eps) * b, so adding logb again would double-count.
+                    f_grad, g_grad = ott_to_geomloss_potentials(f_cost, g_cost, a, b, eps=eps)
+
+                    ctx.save_for_backward(x, y, a, b, f_cost, g_cost, f_grad, g_grad)
+                    ctx.eps = eps
+                    ctx.rho_x = None  # OTT backend is balanced only
+                    ctx.rho_y = None
+                    ctx.allow_tf32 = bool(allow_tf32)
+                    ctx.use_exp2 = bool(use_exp2)
+                    ctx.autotune = bool(autotune)
+                    ctx.block_m = block_m
+                    ctx.block_n = block_n
+                    ctx.block_k = block_k
+                    ctx.num_warps = num_warps
+                    ctx.num_stages = int(num_stages)
+
+                    # Balanced OT cost: <a, f> + <b, g>
+                    return (a * f_cost).sum() + (b * g_cost).sum()
+
+                # GeomLoss backend (default): symmetric-update Sinkhorn
+                if last_extrapolation:
+                    f_cost, g_cost, f_grad, g_grad = sinkhorn_geomloss_online_potentials_sqeuclid(
                         x,
                         y,
                         a,
                         b,
-                        f_cost,
-                        g_cost,
-                        f_grad,
-                        g_grad,
-                        perm_x,
-                        perm_y,
-                        offsets_x,
-                        offsets_y,
-                        row_ptr_x,
-                        col_idx_x,
-                        row_ptr_y,
-                        col_idx_y,
+                        blur=self.blur,
+                        scaling=self.scaling,
+                        use_epsilon_scaling=False,
+                        last_extrapolation=True,
+                        allow_tf32=allow_tf32,
+                        use_exp2=use_exp2,
+                        eps=None,
+                        n_iters=None,
+                        diameter=None,
+                        eps_list=eps_list,
+                        rho_x=self.rho_x,
+                        rho_y=self.rho_y,
+                        block_m=block_m,
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        autotune=autotune,
+                        return_prelast=True,
+                        cost_scale=self.cost_scale,
+                        # OTDD label-augmented cost
+                        label_x=_label_x,
+                        label_y=_label_y,
+                        label_cost_matrix=self.label_cost_matrix,
+                        lambda_x=self.lambda_x,
+                        lambda_y=self.lambda_y,
+                        # Early stopping
+                        threshold=self.threshold,
+                        check_every=self.inner_iterations,
                     )
                 else:
-                    ctx.save_for_backward(x, y, a, b, f_cost, g_cost, f_grad, g_grad)
+                    f_cost, g_cost = sinkhorn_geomloss_online_potentials_sqeuclid(
+                        x,
+                        y,
+                        a,
+                        b,
+                        blur=self.blur,
+                        scaling=self.scaling,
+                        use_epsilon_scaling=False,
+                        last_extrapolation=False,
+                        allow_tf32=allow_tf32,
+                        use_exp2=use_exp2,
+                        eps=None,
+                        n_iters=None,
+                        diameter=None,
+                        eps_list=eps_list,
+                        rho_x=self.rho_x,
+                        rho_y=self.rho_y,
+                        block_m=block_m,
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        autotune=autotune,
+                        cost_scale=self.cost_scale,
+                        # OTDD label-augmented cost
+                        label_x=_label_x,
+                        label_y=_label_y,
+                        label_cost_matrix=self.label_cost_matrix,
+                        lambda_x=self.lambda_x,
+                        lambda_y=self.lambda_y,
+                        # Early stopping
+                        threshold=self.threshold,
+                        check_every=self.inner_iterations,
+                    )
+                    f_grad, g_grad = f_cost, g_cost
+
+                ctx.save_for_backward(x, y, a, b, f_cost, g_cost, f_grad, g_grad)
                 ctx.eps = float(eps_list[-1])
+                ctx.rho_x = self.rho_x  # For semi-unbalanced OT gradient
+                ctx.rho_y = self.rho_y
                 ctx.allow_tf32 = bool(allow_tf32)
                 ctx.use_exp2 = bool(use_exp2)
                 ctx.autotune = bool(autotune)
-                ctx.backend = backend
                 ctx.block_m = block_m
                 ctx.block_n = block_n
                 ctx.block_k = block_k
                 ctx.num_warps = num_warps
                 ctx.num_stages = int(num_stages)
-                return (a * f_cost).sum() + (b * g_cost).sum()
+
+                # Cost computation: differs for balanced vs unbalanced/semi-unbalanced OT
+                # Note: With epsilon_schedule matching GeomLoss exactly, potentials match
+                # and the standard cost formulas apply without scaling factors.
+                is_balanced_x = self.rho_x is None
+                is_balanced_y = self.rho_y is None
+
+                if is_balanced_x and is_balanced_y:
+                    # Balanced OT: cost = <a, f> + <b, g>
+                    return (a * f_cost).sum() + (b * g_cost).sum()
+                else:
+                    # Unbalanced / Semi-unbalanced OT cost computation
+                    #
+                    # For fully unbalanced (both rho_x and rho_y not None):
+                    #   Use standard formula: (rho+eps/2)·a·(1-exp(-f/rho))
+                    #   This works because symmetric damping keeps potentials positive.
+                    #
+                    # For semi-unbalanced (one rho is None, one is not):
+                    #   Use balanced formula: <a, f> + <b, g>
+                    #   The unbalanced formula fails because asymmetric damping causes
+                    #   the relaxed potential to shift negative, making (1-exp(-f/rho)) negative.
+                    #   The balanced formula gives correct positive costs.
+                    #
+                    # Note: Semi-unbalanced is a FlashSinkhorn extension not in GeomLoss.
+                    is_semi_unbalanced = is_balanced_x != is_balanced_y
+
+                    if is_semi_unbalanced:
+                        # For semi-unbalanced, use balanced formula to avoid negative costs
+                        return (a * f_cost).sum() + (b * g_cost).sum()
+                    else:
+                        # Fully unbalanced: use standard unbalanced formula
+                        cost = torch.tensor(0.0, device=x.device, dtype=torch.float32)
+                        unbal_weight_x = self.rho_x + ctx.eps / 2
+                        cost_a = (a * (1 - (-f_cost / self.rho_x).exp())).sum()
+                        cost = cost + unbal_weight_x * cost_a
+                        unbal_weight_y = self.rho_y + ctx.eps / 2
+                        cost_b = (b * (1 - (-g_cost / self.rho_y).exp())).sum()
+                        cost = cost + unbal_weight_y * cost_b
+                        return cost
 
             @staticmethod
             def backward(ctx, grad_out):
-                if ctx.backend == "multiscale":
-                    (
+                x, y, a, b, f_cost, g_cost, f_grad, g_grad = ctx.saved_tensors
+                grad_x = grad_y = grad_a = grad_b = None
+
+                if x.requires_grad or y.requires_grad:
+                    gx, gy = _SinkhornGradFn.apply(
                         x,
                         y,
                         a,
                         b,
-                        f_cost,
-                        g_cost,
                         f_grad,
                         g_grad,
-                        perm_x,
-                        perm_y,
-                        offsets_x,
-                        offsets_y,
-                        row_ptr_x,
-                        col_idx_x,
-                        row_ptr_y,
-                        col_idx_y,
-                    ) = ctx.saved_tensors
-                else:
-                    x, y, a, b, f_cost, g_cost, f_grad, g_grad = ctx.saved_tensors
-                grad_x = grad_y = grad_a = grad_b = None
-
-                if x.requires_grad or y.requires_grad:
-                    if ctx.backend == "multiscale":
-                        d = x.shape[1]
-                        bm = ctx.block_m
-                        bn = ctx.block_n
-                        bk = ctx.block_k
-                        nw = ctx.num_warps
-                        if bm is None or bn is None or bk is None or nw is None:
-                            bm_d, bn_d, bk_d, nw_d = _dense_default_block_sizes(
-                                d, x.dtype, ctx.allow_tf32
-                            )
-                            bm = bm_d if bm is None else bm
-                            bn = bn_d if bn is None else bn
-                            bk = bk_d if bk is None else bk
-                            nw = nw_d if nw is None else nw
-                        if bk < 16:
-                            bk = 16
-                        gx, gy = _SinkhornGradFnMultiscale.apply(
-                            x,
-                            y,
-                            a,
-                            b,
-                            f_grad,
-                            g_grad,
-                            perm_x,
-                            perm_y,
-                            offsets_x,
-                            offsets_y,
-                            row_ptr_x,
-                            col_idx_x,
-                            row_ptr_y,
-                            col_idx_y,
-                            ctx.eps,
-                            ctx.allow_tf32,
-                            ctx.use_exp2,
-                            int(bm),
-                            int(bn),
-                            int(bk),
-                            int(nw),
-                            ctx.num_stages,
-                            grad_out,
-                            self.hvp_tau2,
-                            self.hvp_max_cg_iter,
-                            self.hvp_cg_rtol,
-                            self.hvp_cg_atol,
-                            self.hvp_cg_stabilise_every,
-                            self.hvp_preconditioner,
-                            self.hvp_precond_terms,
-                            self.hvp_use_preconditioner,
-                            self.multiscale_blocksparse_backend,
-                            x.requires_grad,
-                            y.requires_grad,
-                        )
-                        grad_x = gx if x.requires_grad else None
-                        grad_y = gy if y.requires_grad else None
-                    else:
-                        gx, gy = _SinkhornGradFn.apply(
-                            x,
-                            y,
-                            a,
-                            b,
-                            f_grad,
-                            g_grad,
-                            ctx.eps,
-                            ctx.allow_tf32,
-                            ctx.use_exp2,
-                            ctx.autotune,
-                            ctx.block_m,
-                            ctx.block_n,
-                            ctx.block_k,
-                            ctx.num_warps,
-                            ctx.num_stages,
-                            grad_out,
-                            self.hvp_tau2,
-                            self.hvp_max_cg_iter,
-                            self.hvp_cg_rtol,
-                            self.hvp_cg_atol,
-                            self.hvp_cg_stabilise_every,
-                            self.hvp_preconditioner,
-                            self.hvp_precond_terms,
-                            self.hvp_use_preconditioner,
-                            x.requires_grad,
-                            y.requires_grad,
-                        )
-                        grad_x = gx if x.requires_grad else None
-                        grad_y = gy if y.requires_grad else None
+                        ctx.eps,
+                        ctx.allow_tf32,
+                        ctx.use_exp2,
+                        ctx.autotune,
+                        ctx.block_m,
+                        ctx.block_n,
+                        ctx.block_k,
+                        ctx.num_warps,
+                        ctx.num_stages,
+                        grad_out,
+                        self.hvp_tau2,
+                        self.hvp_max_cg_iter,
+                        self.hvp_cg_rtol,
+                        self.hvp_cg_atol,
+                        self.hvp_cg_stabilise_every,
+                        self.hvp_preconditioner,
+                        self.hvp_precond_terms,
+                        self.hvp_use_preconditioner,
+                        x.requires_grad,
+                        y.requires_grad,
+                        ctx.rho_x,  # For semi-unbalanced OT HVP
+                        ctx.rho_y,  # For semi-unbalanced OT HVP
+                        self.cost_scale,  # Cost scale for half cost
+                    )
+                    grad_x = gx if x.requires_grad else None
+                    grad_y = gy if y.requires_grad else None
 
                 if a.requires_grad:
                     grad_a = grad_out * f_cost
@@ -1088,24 +834,88 @@ class SamplesLoss(torch.nn.Module):
                     None,
                 )
 
+        def _raw_cost_with_eps(
+            xb: torch.Tensor, yb: torch.Tensor, ab: torch.Tensor, bb: torch.Tensor,
+            eps_list: tuple,
+            label_x_arg: Optional[torch.Tensor] = None,
+            label_y_arg: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            """Compute raw OT cost (with 0.5 scaling for GeomLoss compatibility).
+
+            Args:
+                xb, yb: Point clouds
+                ab, bb: Weights
+                eps_list: Epsilon schedule
+                label_x_arg, label_y_arg: Labels for OTDD (must be explicitly passed
+                    for correct debiased computation where self-transport uses same labels)
+            """
+            # Store original labels before temporarily overriding
+            nonlocal _label_x, _label_y
+            original_label_x, original_label_y = _label_x, _label_y
+
+            # Override labels for this call if provided
+            if label_x_arg is not None or label_y_arg is not None:
+                _label_x = label_x_arg
+                _label_y = label_y_arg
+
+            try:
+                result = _SinkhornCostFn.apply(
+                    xb,
+                    yb,
+                    ab,
+                    bb,
+                    eps_list,
+                    self.last_extrapolation,
+                    self.allow_tf32,
+                    self.use_exp2,
+                    self.autotune,
+                    self.block_m,
+                    self.block_n,
+                    self.block_k,
+                    self.num_warps,
+                    self.num_stages,
+                )
+            finally:
+                # Restore original labels
+                _label_x, _label_y = original_label_x, original_label_y
+
+            return result
+
         def _cost(xb: torch.Tensor, yb: torch.Tensor, ab: torch.Tensor, bb: torch.Tensor) -> torch.Tensor:
+            """Compute OT cost, with debiasing if enabled.
+
+            Debiased Sinkhorn divergence (when debias=True):
+              S_ε(α, β) = OT_ε(α, β) - 0.5 * OT_ε(α, α) - 0.5 * OT_ε(β, β)
+
+            This makes the divergence:
+            - Zero when α = β (positive semi-definite)
+            - Interpolates between OT and MMD as ε varies
+
+            IMPORTANT: All three Sinkhorn problems use the same epsilon schedule
+            (computed from the cross-transport diameter), following GeomLoss convention.
+
+            For OTDD label-augmented cost, each OT problem must use correct labels:
+            - OT(x, y): label_x for source, label_y for target
+            - OT(x, x): label_x for BOTH source and target
+            - OT(y, y): label_y for BOTH source and target
+            """
+            # Compute eps_list from the cross-transport diameter
             eps_list = tuple(self._eps_list_for_inputs(xb, yb))
-            return _SinkhornCostFn.apply(
-                xb,
-                yb,
-                ab,
-                bb,
-                eps_list,
-                self.last_extrapolation,
-                self.allow_tf32,
-                self.use_exp2,
-                self.autotune,
-                self.block_m,
-                self.block_n,
-                self.block_k,
-                self.num_warps,
-                self.num_stages,
-            )
+
+            # For cross-transport, use the original labels
+            cost_xy = _raw_cost_with_eps(xb, yb, ab, bb, eps_list, _label_x, _label_y)
+
+            if not self.debias:
+                return cost_xy
+
+            # Compute self-transport terms for debiasing
+            # Use the SAME eps_list as the cross-transport (GeomLoss convention)
+            # CRITICAL for OTDD: Self-transport uses same labels for both source and target
+            cost_xx = _raw_cost_with_eps(xb, xb, ab, ab, eps_list, _label_x, _label_x)  # OT(x, x) with labels_x, labels_x
+            cost_yy = _raw_cost_with_eps(yb, yb, bb, bb, eps_list, _label_y, _label_y)  # OT(y, y) with labels_y, labels_y
+
+            # Sinkhorn divergence: OT(x,y) - 0.5*OT(x,x) - 0.5*OT(y,y)
+            return cost_xy - 0.5 * cost_xx - 0.5 * cost_yy
 
         # Batched inputs: match GeomLoss by returning a vector of size (B,).
         if parsed.batched:
@@ -1114,56 +924,37 @@ class SamplesLoss(torch.nn.Module):
                 g_list = []
                 for xb, yb, ab, bb in zip(parsed.x, parsed.y, parsed.a, parsed.b):
                     eps_list = tuple(self._eps_list_for_inputs(xb, yb))
-                    backend = self.backend
-                    if backend == "auto":
-                        if xb.shape[1] <= 3 and xb.shape[0] * yb.shape[0] > 10000**2:
-                            backend = "multiscale"
-                        else:
-                            backend = "online"
-                    if backend == "multiscale":
-                        fb, gb = sinkhorn_geomloss_multiscale_potentials_sqeuclid(
-                            xb,
-                            yb,
-                            ab,
-                            bb,
-                            blur=self.blur,
-                            scaling=self.scaling,
-                            use_epsilon_scaling=False,
-                            last_extrapolation=self.last_extrapolation,
-                            allow_tf32=self.allow_tf32,
-                            use_exp2=self.use_exp2,
-                            eps_list=eps_list,
-                            truncate=self.truncate,
-                            cluster_scale=self.cluster_scale,
-                            max_coarse_levels=self.max_coarse_levels,
-                            blocksparse_backend=self.multiscale_blocksparse_backend,
-                            block_m=self.block_m,
-                            block_n=self.block_n,
-                            block_k=self.block_k,
-                            num_warps=self.num_warps,
-                            num_stages=self.num_stages,
-                            autotune=self.autotune,
-                        )
-                    else:
-                        fb, gb = sinkhorn_geomloss_online_potentials_sqeuclid(
-                            xb,
-                            yb,
-                            ab,
-                            bb,
-                            blur=self.blur,
-                            scaling=self.scaling,
-                            use_epsilon_scaling=False,
-                            last_extrapolation=self.last_extrapolation,
-                            allow_tf32=self.allow_tf32,
-                            use_exp2=self.use_exp2,
-                            eps_list=eps_list,
-                            block_m=self.block_m,
-                            block_n=self.block_n,
-                            block_k=self.block_k,
-                            num_warps=self.num_warps,
-                            num_stages=self.num_stages,
-                            autotune=self.autotune,
-                        )
+                    fb, gb = sinkhorn_geomloss_online_potentials_sqeuclid(
+                        xb,
+                        yb,
+                        ab,
+                        bb,
+                        blur=self.blur,
+                        scaling=self.scaling,
+                        use_epsilon_scaling=False,
+                        last_extrapolation=self.last_extrapolation,
+                        allow_tf32=self.allow_tf32,
+                        use_exp2=self.use_exp2,
+                        eps_list=eps_list,
+                        rho_x=self.rho_x,
+                        rho_y=self.rho_y,
+                        block_m=self.block_m,
+                        block_n=self.block_n,
+                        block_k=self.block_k,
+                        num_warps=self.num_warps,
+                        num_stages=self.num_stages,
+                        autotune=self.autotune,
+                        cost_scale=self.cost_scale,
+                        # OTDD label-augmented cost (batched not fully supported)
+                        label_x=_label_x,
+                        label_y=_label_y,
+                        label_cost_matrix=self.label_cost_matrix,
+                        lambda_x=self.lambda_x,
+                        lambda_y=self.lambda_y,
+                        # Early stopping
+                        threshold=self.threshold,
+                        check_every=self.inner_iterations,
+                    )
                     f_list.append(fb)
                     g_list.append(gb)
                 f_b = torch.stack(f_list, dim=0).view(parsed.a_view_shape)
@@ -1175,37 +966,30 @@ class SamplesLoss(torch.nn.Module):
 
         if self.potentials:
             eps_list = tuple(self._eps_list_for_inputs(parsed.x, parsed.y))
-            backend = self.backend
-            if backend == "auto":
-                if parsed.x.shape[1] <= 3 and parsed.x.shape[0] * parsed.y.shape[0] > 10000**2:
-                    backend = "multiscale"
-                else:
-                    backend = "online"
-            if backend == "multiscale":
-                f, g = sinkhorn_geomloss_multiscale_potentials_sqeuclid(
+            if self.backend == "alternating":
+                # OTT backend: use alternating-update Sinkhorn
+                loga = log_weights(parsed.a).contiguous()
+                logb = log_weights(parsed.b).contiguous()
+                eps = float(eps_list[-1])
+                n_iters = len(eps_list)
+                f, g = sinkhorn_ott_potentials_sqeuclid(
                     parsed.x,
                     parsed.y,
-                    parsed.a,
-                    parsed.b,
-                    blur=self.blur,
-                    scaling=self.scaling,
-                    use_epsilon_scaling=False,
-                    last_extrapolation=self.last_extrapolation,
+                    loga,
+                    logb,
+                    eps,
+                    n_iters,
+                    autotune=self.autotune,
                     allow_tf32=self.allow_tf32,
                     use_exp2=self.use_exp2,
-                    eps_list=eps_list,
-                    truncate=self.truncate,
-                    cluster_scale=self.cluster_scale,
-                    max_coarse_levels=self.max_coarse_levels,
-                    blocksparse_backend=self.multiscale_blocksparse_backend,
                     block_m=self.block_m,
                     block_n=self.block_n,
                     block_k=self.block_k,
                     num_warps=self.num_warps,
                     num_stages=self.num_stages,
-                    autotune=self.autotune,
                 )
             else:
+                # GeomLoss backend (default): symmetric-update Sinkhorn
                 f, g = sinkhorn_geomloss_online_potentials_sqeuclid(
                     parsed.x,
                     parsed.y,
@@ -1218,12 +1002,24 @@ class SamplesLoss(torch.nn.Module):
                     allow_tf32=self.allow_tf32,
                     use_exp2=self.use_exp2,
                     eps_list=eps_list,
+                    rho_x=self.rho_x,
+                    rho_y=self.rho_y,
                     block_m=self.block_m,
                     block_n=self.block_n,
                     block_k=self.block_k,
                     num_warps=self.num_warps,
                     num_stages=self.num_stages,
                     autotune=self.autotune,
+                    cost_scale=self.cost_scale,
+                    # OTDD label-augmented cost
+                    label_x=_label_x,
+                    label_y=_label_y,
+                    label_cost_matrix=self.label_cost_matrix,
+                    lambda_x=self.lambda_x,
+                    lambda_y=self.lambda_y,
+                    # Early stopping
+                    threshold=self.threshold,
+                    check_every=self.inner_iterations,
                 )
             return f.view(parsed.a_view_shape), g.view(parsed.b_view_shape)
 

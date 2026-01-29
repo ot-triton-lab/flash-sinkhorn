@@ -1,4 +1,10 @@
-"""OT Triton: Sinkhorn OT kernels in PyTorch + Triton."""
+"""FlashSinkhorn: Streaming Entropic Optimal Transport in PyTorch + Triton.
+
+FlashSinkhorn uses FlashAttention-style streaming to compute Sinkhorn OT
+without materializing the n×m cost matrix, enabling O(nd) memory usage.
+
+Package name: ot_triton
+"""
 
 from ot_triton.samples_loss import SamplesLoss
 from ot_triton.cg import CGInfo, conjugate_gradient
@@ -7,7 +13,7 @@ from ot_triton.hvp import (
     geomloss_to_ott_potentials,
     hvp_x_sqeuclid,
     hvp_x_sqeuclid_from_potentials,
-    hvp_x_sqeuclid_multiscale,
+    inverse_hvp_x_sqeuclid_from_potentials,
 )
 
 __all__ = [
@@ -18,7 +24,7 @@ __all__ = [
     "geomloss_to_ott_potentials",
     "hvp_x_sqeuclid",
     "hvp_x_sqeuclid_from_potentials",
-    "hvp_x_sqeuclid_multiscale",
+    "inverse_hvp_x_sqeuclid_from_potentials",
     "__version__",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

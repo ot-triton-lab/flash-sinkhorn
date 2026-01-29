@@ -4,7 +4,6 @@ import torch
 from ot_triton import SamplesLoss
 from ot_triton.hvp import geomloss_to_ott_potentials
 from ot_triton.hvp import hvp_x_sqeuclid_from_potentials
-from ot_triton.hvp import hvp_x_sqeuclid_multiscale
 from ot_triton.kernels.sinkhorn_triton_geomloss_sqeuclid import (
     sinkhorn_geomloss_online_potentials_sqeuclid,
 )
@@ -137,9 +136,43 @@ def test_samplesloss_matches_kernel_wrapper_for_potentials():
     torch.testing.assert_close(g_api, g_k, rtol=1e-5, atol=1e-5)
 
 
-def test_samplesloss_debias_not_implemented():
-    with pytest.raises(NotImplementedError):
-        SamplesLoss(debias=True)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton.")
+def test_samplesloss_debias_computes_sinkhorn_divergence():
+    """Test that debias=True computes the Sinkhorn divergence correctly.
+
+    Sinkhorn divergence: S_ε(α, β) = OT_ε(α, β) - 0.5 * OT_ε(α, α) - 0.5 * OT_ε(β, β)
+
+    This test verifies:
+    1. When x == y, the debiased loss should be ~0 (positive semi-definite)
+    2. The debiased loss equals the manual computation OT(x,y) - 0.5*OT(x,x) - 0.5*OT(y,y)
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+
+    n, m, d = 128, 96, 32
+    x = torch.randn(n, d, device=device, dtype=torch.float32)
+    y = torch.randn(m, d, device=device, dtype=torch.float32)
+
+    a = torch.full((n,), 1.0 / n, device=device, dtype=torch.float32)
+    b = torch.full((m,), 1.0 / m, device=device, dtype=torch.float32)
+
+    loss_debias = SamplesLoss(blur=0.1, scaling=0.5, debias=True, potentials=False, allow_tf32=False)
+    loss_no_debias = SamplesLoss(blur=0.1, scaling=0.5, debias=False, potentials=False, allow_tf32=False)
+
+    # Test 1: Debiased loss for identical distributions should be ~0
+    cost_xx_debias = loss_debias(a, x, a, x)
+    assert cost_xx_debias.abs() < 1e-4, f"Debiased self-transport should be ~0, got {cost_xx_debias.item()}"
+
+    # Test 2: Manual computation of Sinkhorn divergence
+    cost_xy = loss_no_debias(a, x, b, y)  # OT(x, y)
+    cost_xx = loss_no_debias(a, x, a, x)  # OT(x, x)
+    cost_yy = loss_no_debias(b, y, b, y)  # OT(y, y)
+    manual_debias = cost_xy - 0.5 * cost_xx - 0.5 * cost_yy
+
+    cost_debias = loss_debias(a, x, b, y)
+
+    # The debiased loss from the API should match manual computation
+    torch.testing.assert_close(cost_debias, manual_debias, rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton.")
@@ -328,85 +361,6 @@ def test_samplesloss_double_backward_matches_hvp_x_reference():
             block_n=loss.block_n,
             block_k=loss.block_k,
             num_warps=int(loss.num_warps or 4),
-            num_stages=loss.num_stages,
-        )
-
-    torch.testing.assert_close(hvp_autograd, hvp_ref, rtol=1e-5, atol=1e-5)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton.")
-def test_samplesloss_double_backward_multiscale_matches_hvp_x_reference():
-    device = torch.device("cuda")
-    torch.manual_seed(0)
-
-    n, m, d = 64, 48, 3
-    eps = 0.2
-    n_iters = 3
-
-    x = torch.randn(n, d, device=device, dtype=torch.float32, requires_grad=True)
-    y = torch.randn(m, d, device=device, dtype=torch.float32)
-
-    a = torch.rand(n, device=device, dtype=torch.float32) + 0.1
-    b = torch.rand(m, device=device, dtype=torch.float32) + 0.1
-    a = a / a.sum()
-    b = b / b.sum()
-
-    loss = SamplesLoss(
-        blur=0.1,
-        scaling=0.5,
-        debias=False,
-        potentials=False,
-        normalize=False,
-        backend="multiscale",
-        multiscale_blocksparse_backend="taskcsr",
-        use_epsilon_scaling=False,
-        eps=eps,
-        n_iters=n_iters,
-        truncate=5.0,
-        allow_tf32=False,
-        use_exp2=False,
-        autotune=False,
-        block_m=32,
-        block_n=32,
-        block_k=16,
-        num_warps=1,
-        hvp_tau2=1e-5,
-        hvp_max_cg_iter=64,
-        hvp_cg_rtol=1e-6,
-        hvp_cg_atol=1e-6,
-        hvp_use_preconditioner=True,
-    )
-
-    val = loss(a, x, b, y)
-    grad_x = torch.autograd.grad(val, x, create_graph=True)[0]
-
-    v = torch.randn_like(x)
-    hvp_autograd = torch.autograd.grad((grad_x * v).sum(), x)[0]
-
-    with torch.no_grad():
-        hvp_ref, _ = hvp_x_sqeuclid_multiscale(
-            x.detach(),
-            y,
-            a,
-            b,
-            v,
-            eps_list=[eps] * n_iters,
-            truncate=loss.truncate,
-            cluster_scale=loss.cluster_scale,
-            max_coarse_levels=loss.max_coarse_levels,
-            multiscale_blocksparse_backend=loss.multiscale_blocksparse_backend,
-            tau2=loss.hvp_tau2,
-            max_cg_iter=loss.hvp_max_cg_iter,
-            cg_rtol=loss.hvp_cg_rtol,
-            cg_atol=loss.hvp_cg_atol,
-            use_preconditioner=loss.hvp_use_preconditioner,
-            allow_tf32=False,
-            use_exp2=False,
-            autotune=False,
-            block_m=loss.block_m,
-            block_n=loss.block_n,
-            block_k=loss.block_k,
-            num_warps=loss.num_warps,
             num_stages=loss.num_stages,
         )
 

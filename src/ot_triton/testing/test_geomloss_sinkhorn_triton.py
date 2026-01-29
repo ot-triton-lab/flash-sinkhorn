@@ -234,7 +234,7 @@ def test_samplesloss_backward_matches_geomloss_tensorized():
         blur=blur,
         scaling=scaling,
         diameter=diameter,
-        cost=_sqdist_cost_full,
+        cost=_sqdist_cost_full,  # Use full cost to match our kernel's convention
         debias=False,
         potentials=False,
         backend="tensorized",
@@ -254,3 +254,73 @@ def test_samplesloss_backward_matches_geomloss_tensorized():
     torch.testing.assert_close(val_t, val_g, rtol=5e-3, atol=5e-3)
     torch.testing.assert_close(grad_x_t, grad_x_g, rtol=5e-3, atol=5e-3)
     torch.testing.assert_close(grad_y_t, grad_y_g, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton.")
+@pytest.mark.parametrize("d", [1025, 2048, 4096])
+def test_large_d_gradient_regression(d):
+    """Regression test for large-D gradient path (d > 1024 uses tiled kernel).
+
+    This test exercises the large-D kernel path which tiles over the feature
+    dimension and accumulates into global memory instead of shared memory.
+
+    Tests dimensions up to d=4096 to match the documented "tested up to d=4096"
+    in GRADIENT_HVP.md and README.md.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    # Use smaller n,m for larger d to keep test fast and avoid OOM
+    n, m = (32, 32) if d >= 4096 else (64, 64)
+    x = torch.randn(n, d, device=device, dtype=torch.float32, requires_grad=True)
+    y = torch.randn(m, d, device=device, dtype=torch.float32, requires_grad=True)
+
+    a = torch.ones(n, device=device, dtype=torch.float32) / n
+    b = torch.ones(m, device=device, dtype=torch.float32) / m
+
+    loss = SamplesLoss(
+        "sinkhorn",
+        blur=0.5,  # Larger blur for stability at high d
+        scaling=0.5,
+        debias=False,
+        potentials=False,
+        normalize=False,
+        use_epsilon_scaling=False,
+        eps=0.25,
+        n_iters=32,
+        allow_tf32=False,
+        use_exp2=False,
+    )
+
+    # Forward pass
+    val = loss(a, x, b, y)
+
+    # Backward pass - this exercises the large-D kernel
+    grad_x, grad_y = torch.autograd.grad(val, (x, y))
+
+    # Basic sanity checks
+    assert grad_x.shape == x.shape, f"grad_x shape mismatch: {grad_x.shape} vs {x.shape}"
+    assert grad_y.shape == y.shape, f"grad_y shape mismatch: {grad_y.shape} vs {y.shape}"
+    assert torch.isfinite(grad_x).all(), "grad_x contains non-finite values"
+    assert torch.isfinite(grad_y).all(), "grad_y contains non-finite values"
+    assert grad_x.abs().max() > 0, "grad_x is all zeros"
+    assert grad_y.abs().max() > 0, "grad_y is all zeros"
+
+    # Gradient direction consistency: moving in -grad direction should not increase loss significantly
+    # Use relative tolerance to handle varying loss magnitudes across dimensions
+    with torch.no_grad():
+        # Use adaptive step size based on gradient norm (smaller for large gradients)
+        grad_norm = grad_x.norm()
+        step = 0.01 / max(grad_norm.item(), 1.0)
+        x_new = x - step * grad_x
+        val_new = loss(a, x_new, b, y)
+
+        # Check with relative tolerance: val_new <= val * (1 + rtol) + atol
+        # This is more robust to varying loss magnitudes and curvature
+        rtol = 0.05  # 5% relative tolerance
+        atol = 1e-2  # Absolute tolerance for small losses
+        threshold = val * (1 + rtol) + atol
+        assert val_new <= threshold, (
+            f"Gradient direction inconsistent: val={val:.6f}, val_new={val_new:.6f}, "
+            f"threshold={threshold:.6f}, step={step:.6f}"
+        )

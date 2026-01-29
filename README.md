@@ -1,146 +1,202 @@
-# OT Triton
+# FlashSinkhorn
 
-OT Triton is a research-focused implementation of **entropic optimal transport (Sinkhorn)** in **PyTorch + Triton** for **squared Euclidean cost only**. The key contribution is a **fused, streaming Triton kernel** that computes **log-sum-exp (LSE) online**, **never materializing the `n x m` cost/kernel matrix**. The LSE reduction uses a **FlashAttention-like heuristic**: stream tiles, maintain a running max + sumexp, and optionally use `exp2/log2` for stability and speed.
+**Streaming Entropic Optimal Transport in PyTorch + Triton**
 
-## What this repo provides
+FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**never materializing the n×m cost matrix**—enabling **O(nd) memory** instead of O(n²).
 
-- **GeomLoss-style online Sinkhorn** (symmetric updates, optional epsilon scaling), fully fused in Triton.
-- **OTT-style alternating updates** for potentials (`f,g`) in log-domain.
-- **SamplesLoss-like API** (`ot_triton.SamplesLoss`) for drop-in usage.
-- **Analytic gradients** (no backprop through iterations).
-- **Hessian-vector product (HVP)** w.r.t. `x` (streaming, no plan materialization). CG preconditioners: `none` (default), `jacobi`, `neumann-k`.
-- **Multiscale (D=1/2/3) blocksparse** backends for approximate large-scale OT.
+## Features
 
-Constraints:
-- Cost is **full squared Euclidean**: `||x-y||^2`.
-- Online mode only (no dense `n x m` cost/plan allocation in kernels).
+- **Fused Triton kernels** for forward, gradient, and HVP
+- **GeomLoss-compatible API** (`SamplesLoss`)
+- **Analytic gradients** (no backprop through Sinkhorn iterations)
+- **Hessian-vector products** via streaming CG solver
+- **Half-cost support** (`half_cost=True`) for exact GeomLoss parity
+- **Unbalanced/semi-unbalanced OT** via `reach` parameter
+- **Large-D support** (d > 1024) with tiled gradient kernel
+- **Early stopping** with convergence threshold
 
 ## Install
 
 ```bash
 pip install -e .
-pip install -e ".[dev]"
+pip install -e ".[dev]"  # with dev dependencies
 ```
 
-Environment snapshot (this repo):
+**Requirements:** PyTorch ≥2.5, Triton ≥3.1, CUDA 12.x
 
-- Conda env: `jax311`
-- Python: 3.11.13
-- CUDA toolkit: 12.1
-- GPU: NVIDIA A100-SXM4-80GB
-- torch: 2.5.1+cu121
-- triton: 3.1.0
+## Quick Start
 
-Only `torch` and `triton` are required for usage. Other packages are for benchmarks only.
-
-## Quickstart
-
-### Fused GeomLoss-style potentials (online, fixed eps)
-
-```python
-import torch
-from ot_triton.kernels import sinkhorn_geomloss_online_potentials_sqeuclid
-
-x = torch.randn(8192, 64, device="cuda", dtype=torch.float32)
-y = torch.randn(8192, 64, device="cuda", dtype=torch.float32)
-a = torch.rand(8192, device="cuda", dtype=torch.float32) + 0.1
-b = torch.rand(8192, device="cuda", dtype=torch.float32) + 0.1
-a = a / a.sum()
-b = b / b.sum()
-
-f, g = sinkhorn_geomloss_online_potentials_sqeuclid(
-    x,
-    y,
-    a,
-    b,
-    use_epsilon_scaling=False,
-    eps_list=[0.1] * 16,
-    allow_tf32=False,   # strict FP32
-    use_exp2=True,      # FlashAttention-like exp2/log2 path
-)
-```
-
-### SamplesLoss-like API
+### Basic Usage
 
 ```python
 import torch
 from ot_triton import SamplesLoss
 
-loss = SamplesLoss("sinkhorn", blur=0.1, scaling=0.5, debias=False)
-val = loss(torch.randn(4096, 64, device="cuda"),
-           torch.randn(4096, 64, device="cuda"))
+x = torch.randn(4096, 64, device="cuda")
+y = torch.randn(4096, 64, device="cuda")
+
+loss = SamplesLoss(loss="sinkhorn", blur=0.1, debias=True)
+cost = loss(x, y)
 ```
 
-### Gradient (analytic, no backprop through iterations)
+### Gradient Flow
 
 ```python
-import torch
-from ot_triton import SamplesLoss
-
 x = torch.randn(4096, 64, device="cuda", requires_grad=True)
 y = torch.randn(4096, 64, device="cuda")
 
-loss = SamplesLoss("sinkhorn", blur=0.1, scaling=0.5, debias=False)
-val = loss(x, y)
-grad_x = torch.autograd.grad(val, x)[0]  # analytic gradient kernel
+loss = SamplesLoss(loss="sinkhorn", blur=0.1, debias=True)
+cost = loss(x, y)
+grad_x = torch.autograd.grad(cost, x)[0]  # Analytic gradient
 ```
 
-### Hessian-Vector Product (HVP, analytic, no backprop through iterations)
+### GeomLoss Parity
+
+Use `half_cost=True` to match GeomLoss's cost convention:
 
 ```python
-# Double backward gives HVP via CG solver (no plan materialization)
+# FlashSinkhorn with half_cost matches GeomLoss exactly
+flash_loss = SamplesLoss(loss="sinkhorn", blur=0.1, half_cost=True, debias=True)
+
+# Equivalent GeomLoss call
+# geomloss_loss = geomloss.SamplesLoss(loss="sinkhorn", p=2, blur=0.1, debias="positive")
+```
+
+### Unbalanced OT
+
+For distributions with different total mass or outliers:
+
+```python
+loss = SamplesLoss(
+    loss="sinkhorn",
+    blur=0.1,
+    debias=True,
+    reach=1.0,  # Unbalanced OT with KL penalty
+)
+```
+
+### Semi-Unbalanced OT
+
+Different constraints for source vs target:
+
+```python
+loss = SamplesLoss(
+    loss="sinkhorn",
+    blur=0.1,
+    reach_x=1.0,   # Relax source marginal
+    reach_y=None,  # Keep target marginal strict (balanced)
+)
+```
+
+### Early Stopping
+
+```python
+loss = SamplesLoss(
+    loss="sinkhorn",
+    blur=0.1,
+    n_iters=100,
+    threshold=1e-3,       # Stop when potential change < threshold
+    inner_iterations=10,  # Check every N iterations
+)
+```
+
+### Hessian-Vector Product
+
+```python
+x = torch.randn(4096, 64, device="cuda", requires_grad=True)
+y = torch.randn(4096, 64, device="cuda")
 v = torch.randn_like(x)
-grad_x = torch.autograd.grad(val, x, create_graph=True)[0]
-hvp_x = torch.autograd.grad((grad_x * v).sum(), x)[0]  # analytic HVP kernel
+
+loss = SamplesLoss(loss="sinkhorn", blur=0.1)
+cost = loss(x, y)
+
+# First-order gradient
+grad_x = torch.autograd.grad(cost, x, create_graph=True)[0]
+
+# HVP via double backward (uses streaming CG solver)
+hvp = torch.autograd.grad((grad_x * v).sum(), x)[0]
 ```
 
-For more details (preconditioners, multiscale HVP, manual API), see [GRADIENT_HVP.md](GRADIENT_HVP.md).
+## API Reference
 
-## FlashAttention-like LSE heuristic (core idea)
+### SamplesLoss
 
-The fused kernels:
+```python
+SamplesLoss(
+    loss="sinkhorn",
+    p=2,                      # Only p=2 supported (squared Euclidean)
+    blur=0.05,                # Regularization: eps = blur^2
+    debias=True,              # Debiased Sinkhorn divergence
+    half_cost=False,          # Use ||x-y||²/2 to match GeomLoss
+    reach=None,               # Unbalanced OT (None = balanced)
+    reach_x=None,             # Semi-unbalanced: source marginal
+    reach_y=None,             # Semi-unbalanced: target marginal
+    scaling=0.5,              # Epsilon annealing factor
+    n_iters=None,             # Max iterations (None = use scaling)
+    threshold=None,           # Early stopping threshold
+    inner_iterations=10,      # Check convergence every N iters
+)
+```
 
-- stream tiles of `(x,y)` and **compute costs on the fly**,
-- keep a **running max** and **sumexp accumulator** (online LSE),
-- optionally compute in `exp2/log2` space for stability,
-- never allocate a dense `n x m` cost matrix.
+### Low-Level API
 
-This is the main performance trick that makes large-scale OT feasible without full matrix materialization.
+```python
+from ot_triton.kernels.sinkhorn_triton_geomloss_sqeuclid import (
+    sinkhorn_geomloss_online_potentials_sqeuclid,
+)
+from ot_triton.kernels.sinkhorn_triton_grad_sqeuclid import (
+    sinkhorn_geomloss_online_grad_sqeuclid,
+)
+from ot_triton.hvp import hvp_x_sqeuclid_from_potentials
+```
 
-## Benchmarks (strict FP32)
+## Key Concepts
 
-OTT-style parity benchmark (Torch+Triton vs JAX+OTT):
+### Cost Convention
 
+- **FlashSinkhorn default**: `C(x,y) = ||x-y||²`
+- **GeomLoss p=2 default**: `C(x,y) = ||x-y||²/2`
+- Use `half_cost=True` to match GeomLoss
+
+### Memory Efficiency
+
+FlashSinkhorn streams tiles of (x,y) and computes costs on-the-fly:
+- **Forward**: O(nd) memory (no n×m cost matrix)
+- **Gradient**: O(nd) memory (streaming accumulation)
+- **HVP**: O(nd) memory (CG solver with streaming matvec)
+
+### Numerical Stability
+
+- Uses `exp2/log2` for stable LSE computation
+- Safe log/division guards against underflow
+- TF32 disabled by default for reproducibility
+
+## Benchmarks
+
+Compare FlashSinkhorn against GeomLoss (KeOps) and OTT-JAX.
+
+**Install benchmark dependencies:**
 ```bash
-python -m ot_triton.bench.bench_sinkhorn_ott_full \
-  --n 8192 --m 8192 --d 64 --dtype float32 --eps 0.1 --n-iters 1 \
-  --batch-size 256 --jax-matmul-precision highest --bench-order jax-first \
-  --autotune
+pip install geomloss pykeops ott-jax jax[cuda12]
 ```
 
-Online Sinkhorn (GeomLoss-style) vs GeomLoss vs OTT/JAX:
-
+**Run benchmarks:**
 ```bash
-PYTHONPATH=src python -m ot_triton.bench.plots.plot_benchmarks_sinkhorn_vs_geomloss_ott_eps0p1_d64
+# Forward pass benchmark
+python -m ot_triton.bench.bench_forward --sizes 5000,10000,20000 --dims 64 --verify
+
+# Backward pass benchmark
+python -m ot_triton.bench.bench_backward --sizes 5000,10000,20000 --dims 64 --verify
+
+# Quick test (small size)
+python -m ot_triton.bench.bench_forward --sizes 5000 --dims 4 --verify
+
+# Run only FlashSinkhorn (skip GeomLoss/OTT-JAX)
+python -m ot_triton.bench.bench_forward --sizes 10000 --dims 64 --no-geomloss --no-ott
 ```
 
-Benchmark plots (generated by the script above):
+Results are saved to `output/paper_benchmarks/forward/` and `output/paper_benchmarks/backward/`.
 
-![Online Sinkhorn vs N (log-log)](images/benchmarks/sinkhorn_small_loglog.png)
-![Online Sinkhorn vs N (linear)](images/benchmarks/sinkhorn_large_linear.png)
+## License
 
-## Tuning tips (rule-of-thumb)
-
-- `axis=0` reductions are register-heavy -> keep `BLOCK_N<=64` in fp32.
-- Strict fp32: `BLOCK_K=32` and `num_stages=3` often hide latency best.
-- Use `--autotune` to select a config from a **small curated set** (no blind search).
-
-## Layout
-
-```
-GRADIENT_HVP.md  # gradient + HVP usage
-src/ot_triton/
-  kernels/   # Triton kernels + wrappers
-  testing/   # references and pytest suites
-  bench/     # benchmarks + plots
-```
+MIT

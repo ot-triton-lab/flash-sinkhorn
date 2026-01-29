@@ -8,7 +8,7 @@ from ot_triton.testing.reference_sinkhorn import (
     sinkhorn_potentials_ref,
     sqeuclid_cost,
 )
-from ot_triton.kernels.sinkhorn_triton_sqeuclid import (
+from ot_triton.kernels.sinkhorn_triton_ott_sqeuclid import (
     apply_lse_kernel_sqeuclid,
     apply_transport_from_potentials_sqeuclid,
     sinkhorn_potentials_sqeuclid,

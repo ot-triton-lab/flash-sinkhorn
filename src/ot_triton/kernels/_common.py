@@ -1,9 +1,28 @@
 """Common utilities shared across kernel modules."""
 
-from typing import Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
+
+
+def dampening(eps: float, rho: Optional[float]) -> float:
+    """Compute dampening factor for unbalanced OT with KL marginal penalties.
+
+    For balanced OT (rho=None), returns 1.0.
+    For unbalanced OT, returns 1/(1 + eps/rho), which controls the strength
+    of marginal relaxation.
+
+    Args:
+        eps: Entropy regularization parameter.
+        rho: Marginal constraint penalty (None for balanced OT).
+
+    Returns:
+        Dampening factor in (0, 1] range.
+    """
+    if rho is None:
+        return 1.0
+    return 1.0 / (1.0 + eps / rho)
 
 
 def log_weights(w: torch.Tensor) -> torch.Tensor:
@@ -28,9 +47,12 @@ def epsilon_schedule(
 ) -> Sequence[float]:
     """Generate exponential epsilon decay schedule for Sinkhorn iterations.
 
+    Matches GeomLoss's epsilon_schedule exactly: exponential cooling from
+    diameter^p down to blur^p with decay factor scaling^p per iteration.
+
     Args:
         diameter: Maximum diameter of the point clouds.
-        blur: Target blur (final epsilon^(1/p)).
+        blur: Target blur (the regularization "blur" parameter from GeomLoss).
         scaling: Decay factor per iteration (0 < scaling < 1).
         p: Cost exponent (default 2 for squared Euclidean).
 
@@ -44,10 +66,14 @@ def epsilon_schedule(
     if not (0.0 < scaling < 1.0):
         raise ValueError("scaling must be in (0, 1).")
 
+    # Match GeomLoss: final eps = blur^p
+    final_eps = blur ** p
+    log_final = p * np.log(blur)
+
     eps_list = [diameter**p]
     eps_list += [
         float(np.exp(e))
-        for e in np.arange(p * np.log(diameter), p * np.log(blur), p * np.log(scaling))
+        for e in np.arange(p * np.log(diameter), log_final, p * np.log(scaling))
     ]
-    eps_list += [blur**p]
+    eps_list += [final_eps]
     return eps_list
