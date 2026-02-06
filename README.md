@@ -260,6 +260,20 @@ python -m ot_triton.bench.bench_forward --sizes 10000 --dims 64 --no-geomloss --
 
 Results are saved to `output/paper_benchmarks/forward/` and `output/paper_benchmarks/backward/`.
 
+## Citation
+
+If you find FlashSinkhorn useful in your research, please cite our paper:
+
+```bibtex
+@article{ye2026flashsinkhorn,
+  title={FlashSinkhorn: IO-Aware Entropic Optimal Transport},
+  author={Ye, Felix X.-F. and Li, Xingjie and Yu, An and Chang, Ming-Ching and Chu, Linsong and Wertheimer, Davis},
+  journal={arXiv preprint arXiv:2602.03067},
+  year={2026},
+  url={https://arxiv.org/abs/2602.03067}
+}
+```
+
 ## License
 
 MIT
