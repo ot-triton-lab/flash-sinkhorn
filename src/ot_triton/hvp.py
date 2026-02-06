@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -24,14 +25,16 @@ from ot_triton.kernels.sinkhorn_triton_cg_dense import (
     hvp_dense_cg,
     DenseCgInfo,
 )
-from ot_triton.kernels.sinkhorn_triton_geomloss_sqeuclid import log_weights
-from ot_triton.kernels.sinkhorn_triton_geomloss_sqeuclid import (
-    sinkhorn_geomloss_online_potentials_sqeuclid,
+# Import from _common for utility functions
+from ot_triton.kernels._common import log_weights
+# Import FlashSinkhorn for the solver (no longer using deprecated geomloss module)
+from ot_triton.kernels.sinkhorn_flashstyle_sqeuclid import (
+    sinkhorn_flashstyle_symmetric,
 )
 from ot_triton.kernels.sinkhorn_triton_apply_sqeuclid import (
-    apply_plan_vec_sqeuclid,
-    apply_plan_mat_sqeuclid,
-    mat5_sqeuclid,
+    apply_plan_vec_flashstyle,
+    apply_plan_mat_flashstyle,
+    mat5_sqeuclid,  # Keep OTT-style for now, converts internally
 )
 from ot_triton.kernels.sinkhorn_triton_apply_fused_sqeuclid import (
     fused_schur_matvec_sqeuclid,
@@ -106,15 +109,34 @@ def sinkhorn_prelast_potentials_sqeuclid(
     allow_tf32: bool = False,
     use_exp2: bool = True,
     autotune: bool = True,
-    block_m: Optional[int] = None,
-    block_n: Optional[int] = None,
-    block_k: Optional[int] = None,
-    num_warps: Optional[int] = None,
-    num_stages: int = 2,
+    block_m: Optional[int] = None,  # Ignored, kept for backward compat
+    block_n: Optional[int] = None,  # Ignored, kept for backward compat
+    block_k: Optional[int] = None,  # Ignored, kept for backward compat
+    num_warps: Optional[int] = None,  # Ignored, kept for backward compat
+    num_stages: int = 2,  # Ignored, kept for backward compat
+    use_flashstyle: bool = True,  # Deprecated, always uses FlashSinkhorn now
+    cost_scale: float = 1.0,  # Cost scaling (1.0 for full, 0.5 for half)
+    rho_x: Optional[float] = None,  # Unbalanced OT source penalty
+    rho_y: Optional[float] = None,  # Unbalanced OT target penalty
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return prelast potentials (f_grad, g_grad) at final epsilon."""
+    """Return prelast potentials (f_grad, g_grad) at final epsilon.
 
-    f_cost, g_cost, f_grad, g_grad = sinkhorn_geomloss_online_potentials_sqeuclid(
+    Args:
+        x, y: Point clouds [n, d] and [m, d]
+        a, b: Marginal weights [n] and [m]
+        eps_list: Epsilon schedule
+        allow_tf32: Enable TF32 for matmul
+        use_exp2: Use exp2/log2 optimization
+        autotune: Enable kernel autotuning
+        use_flashstyle: Deprecated, always uses FlashSinkhorn now.
+        cost_scale: Cost scaling (1.0 for full ||x-y||², 0.5 for half)
+        rho_x, rho_y: Unbalanced OT marginal penalties (None = balanced)
+
+    Returns:
+        f_grad, g_grad: Pre-extrapolation potentials at final epsilon
+    """
+    # Always use FlashSinkhorn (old kernel deprecated)
+    f_cost, g_cost, f_grad, g_grad = sinkhorn_flashstyle_symmetric(
         x,
         y,
         a,
@@ -124,13 +146,11 @@ def sinkhorn_prelast_potentials_sqeuclid(
         allow_tf32=allow_tf32,
         use_exp2=use_exp2,
         eps_list=eps_list,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
         autotune=autotune,
         return_prelast=True,
+        cost_scale=cost_scale,
+        rho_x=rho_x,
+        rho_y=rho_y,
     )
     del f_cost, g_cost
     return f_grad, g_grad
@@ -257,45 +277,38 @@ def hvp_x_sqeuclid_from_potentials(
     x_norm2 = (x.float() * x.float()).sum(dim=1).contiguous()
     y_norm2 = (y.float() * y.float()).sum(dim=1).contiguous()
 
+    # =========================================================================
+    # Convert OTT-style potentials to FlashStyle shifted potentials (once)
+    # =========================================================================
+    # OTT convention: P = exp((f_hat + g_hat - C) / eps)
+    # FlashStyle convention: P = a * b * exp((f_shift + g_shift + 2*cs*xy) / eps)
+    #
+    # Conversion: f_shift = f_hat - eps*log_a - alpha (where alpha = cs*||x||²)
+    # For balanced OT, assume uniform marginals: log_a = -log(n), log_b = -log(m)
+    log_a = torch.full((n,), -math.log(n), device=x.device, dtype=torch.float32)
+    log_b = torch.full((m,), -math.log(m), device=x.device, dtype=torch.float32)
+    alpha = cost_scale * x_norm2
+    beta = cost_scale * y_norm2
+    f_shift = f_hat.float() - eps_f * log_a - alpha
+    g_shift = g_hat.float() - eps_f * log_b - beta
+
     def apply_axis1(vec_m: torch.Tensor) -> torch.Tensor:
-        return apply_plan_vec_sqeuclid(
-            x,
-            y,
-            f_hat,
-            g_hat,
-            vec_m,
+        return apply_plan_vec_flashstyle(
+            x, y, f_shift, g_shift, log_a, log_b, vec_m,
             eps=eps_f,
             axis=1,
             cost_scale=cost_scale,
-            x2=x_norm2,
-            y2=y_norm2,
             allow_tf32=allow_tf32,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            num_warps=num_warps,
-            num_stages=num_stages,
             use_exp2=use_exp2,
         )
 
     def apply_axis0(vec_n: torch.Tensor) -> torch.Tensor:
-        return apply_plan_vec_sqeuclid(
-            x,
-            y,
-            f_hat,
-            g_hat,
-            vec_n,
+        return apply_plan_vec_flashstyle(
+            x, y, f_shift, g_shift, log_a, log_b, vec_n,
             eps=eps_f,
             axis=0,
             cost_scale=cost_scale,
-            x2=x_norm2,
-            y2=y_norm2,
             allow_tf32=allow_tf32,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            num_warps=num_warps,
-            num_stages=num_stages,
             use_exp2=use_exp2,
         )
 
@@ -337,46 +350,26 @@ def hvp_x_sqeuclid_from_potentials(
     diag_y = diag_factor_y * b_hat_clamped  # (m,)
 
     vec1 = torch.sum(x * A, dim=1)  # (n,)
-    Py = apply_plan_mat_sqeuclid(
-        x,
-        y,
-        f_hat,
-        g_hat,
-        y,
+    Py = apply_plan_mat_flashstyle(
+        x, y, f_shift, g_shift, log_a, log_b, y.float(),
         eps=eps_f,
         axis=1,
         cost_scale=cost_scale,
-        x2=x_norm2,
-        y2=y_norm2,
         allow_tf32=allow_tf32,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
         use_exp2=use_exp2,
+        autotune=autotune,
     )
 
     x1 = (2.0 * cost_scale) * (a_hat * vec1 - torch.sum(A * Py, dim=1))
 
-    PT_A = apply_plan_mat_sqeuclid(
-        x,
-        y,
-        f_hat,
-        g_hat,
-        A,
+    PT_A = apply_plan_mat_flashstyle(
+        x, y, f_shift, g_shift, log_a, log_b, A.float(),
         eps=eps_f,
         axis=0,
         cost_scale=cost_scale,
-        x2=x_norm2,
-        y2=y_norm2,
         allow_tf32=allow_tf32,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
         use_exp2=use_exp2,
+        autotune=autotune,
     )
     x2 = (2.0 * cost_scale) * (apply_axis0(vec1) - torch.sum(y * PT_A, dim=1))
 
@@ -550,25 +543,15 @@ def hvp_x_sqeuclid_from_potentials(
     z2 = z
 
     vec2_z = apply_axis1(z2)  # (n,)
-    Py_z2 = apply_plan_mat_sqeuclid(
-        x,
-        y,
-        f_hat,
-        g_hat,
-        y,
+    Py_z2 = apply_plan_mat_flashstyle(
+        x, y, f_shift, g_shift, log_a, log_b, y.float(),
         eps=eps_f,
         axis=1,
         cost_scale=cost_scale,
         scale=z2,
-        x2=x_norm2,
-        y2=y_norm2,
         allow_tf32=allow_tf32,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
         use_exp2=use_exp2,
+        autotune=autotune,
     )
     RTz = (2.0 * cost_scale) * (
         x * (a_hat * z1)[:, None] - Py * z1[:, None] + x * vec2_z[:, None] - Py_z2

@@ -71,6 +71,7 @@ Control marginal relaxation via `reach`, `reach_x`, and `reach_y` parameters. Th
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `backend` | `str` | `"symmetric"` | Backend: `"symmetric"` (GeomLoss-style) or `"alternating"` (OTT-JAX-style). |
+| `use_flashstyle` | `bool` | `True` | Use FlashSinkhorn shifted-potential kernels (10-40% faster at n >= 10k). |
 | `autotune` | `bool` | `True` | Enable Triton autotuning for kernel configs. |
 
 **Backend comparison:**
@@ -357,7 +358,64 @@ cost = loss(x, y)
 
 For direct access to the Triton kernels:
 
-### GeomLoss-Style (Symmetric Updates)
+### FlashSinkhorn (Shifted Potentials) — Recommended
+
+```python
+from ot_triton.kernels import (
+    sinkhorn_flashstyle_symmetric,
+    sinkhorn_flashstyle_alternating,
+)
+
+# Symmetric solver (matches GeomLoss interface)
+f, g = sinkhorn_flashstyle_symmetric(
+    x, y, a, b,
+    blur=0.05,
+    scaling=0.9,
+    cost_scale=0.5,  # half_cost for GeomLoss parity
+)
+
+# Alternating solver (matches OTT-JAX interface)
+f, g = sinkhorn_flashstyle_alternating(
+    x, y, log_a, log_b,
+    eps=0.1,
+    n_iters=100,
+)
+```
+
+#### Shifted Potential Transport Plan Application
+
+```python
+from ot_triton.kernels import apply_plan_vec_flashstyle, apply_plan_mat_flashstyle
+
+# Apply transport plan to a vector: result_i = sum_j P(i,j) * v_j
+result = apply_plan_vec_flashstyle(
+    x, y, f_shift, g_shift, log_a, log_b, v,
+    eps=0.1, cost_scale=0.5,
+)
+
+# Apply transport plan to a matrix: result_i = sum_j P(i,j) * M_j
+result = apply_plan_mat_flashstyle(
+    x, y, f_shift, g_shift, log_a, log_b, M,
+    eps=0.1, cost_scale=0.5,
+)
+```
+
+#### Potential Conversion
+
+```python
+from ot_triton.kernels import (
+    standard_to_shifted_potentials,
+    shifted_to_standard_potentials,
+)
+
+# Convert GeomLoss potentials to shifted (for flashstyle apply kernels)
+f_shift, g_shift = standard_to_shifted_potentials(f, g, x, y, cost_scale=0.5)
+
+# Convert shifted back to GeomLoss standard
+f, g = shifted_to_standard_potentials(f_shift, g_shift, x, y, cost_scale=0.5)
+```
+
+### GeomLoss-Style (Symmetric Updates) — Legacy
 
 ```python
 from ot_triton.kernels import sinkhorn_geomloss_symmetric_potentials_sqeuclid
@@ -467,10 +525,21 @@ P = exp((f_hat + g_hat - C) / eps)
 where f_hat = f + eps * log(a), g_hat = g + eps * log(b)
 ```
 
+**Shifted convention (FlashSinkhorn):**
+```
+f_shift = f - cost_scale * ||x||²
+g_shift = g - cost_scale * ||y||²
+```
+The shifted formulation factors out the quadratic norm from the LSE, reducing per-tile operations. The `apply_plan_*_flashstyle` kernels expect shifted potentials.
+
 Convert between conventions:
 ```python
 from ot_triton.hvp import geomloss_to_ott_potentials
 f_hat, g_hat = geomloss_to_ott_potentials(f, g, a, b, eps=0.1)
+
+from ot_triton.kernels import standard_to_shifted_potentials, shifted_to_standard_potentials
+f_shift, g_shift = standard_to_shifted_potentials(f, g, x, y, cost_scale=0.5)
+f, g = shifted_to_standard_potentials(f_shift, g_shift, x, y, cost_scale=0.5)
 ```
 
 ### Numerical Stability

@@ -19,6 +19,10 @@ from ot_triton.kernels.sinkhorn_triton_grad_sqeuclid import (
 from ot_triton.kernels.sinkhorn_triton_ott_sqeuclid import (
     sinkhorn_potentials_sqeuclid as sinkhorn_ott_potentials_sqeuclid,
 )
+from ot_triton.kernels.sinkhorn_flashstyle_sqeuclid import (
+    sinkhorn_flashstyle_alternating,
+    sinkhorn_flashstyle_symmetric,
+)
 
 
 class _SinkhornGradFn(torch.autograd.Function):
@@ -54,6 +58,12 @@ class _SinkhornGradFn(torch.autograd.Function):
         rho_x: Optional[float] = None,  # For semi-unbalanced OT HVP
         rho_y: Optional[float] = None,  # For semi-unbalanced OT HVP
         cost_scale: float = 1.0,  # Cost scaling: 1.0 for full, 0.5 for half
+        # OTDD label-augmented cost parameters
+        label_x: Optional[torch.Tensor] = None,
+        label_y: Optional[torch.Tensor] = None,
+        label_cost_matrix: Optional[torch.Tensor] = None,
+        lambda_x: float = 1.0,
+        lambda_y: float = 0.0,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         gx, gy = sinkhorn_geomloss_online_grad_sqeuclid(
             x,
@@ -75,12 +85,12 @@ class _SinkhornGradFn(torch.autograd.Function):
             compute_grad_x=bool(compute_grad_x),
             compute_grad_y=bool(compute_grad_y),
             cost_scale=float(cost_scale),
-            # Label cost disabled in public release
-            label_x=None,
-            label_y=None,
-            label_cost_matrix=None,
-            lambda_x=1.0,
-            lambda_y=0.0,
+            # OTDD label-augmented cost
+            label_x=label_x,
+            label_y=label_y,
+            label_cost_matrix=label_cost_matrix,
+            lambda_x=float(lambda_x),
+            lambda_y=float(lambda_y),
         )
 
         ctx.save_for_backward(x, y, a, b, f_grad, g_grad, grad_scale)
@@ -104,6 +114,11 @@ class _SinkhornGradFn(torch.autograd.Function):
         ctx.rho_x = rho_x  # For semi-unbalanced OT HVP
         ctx.rho_y = rho_y  # For semi-unbalanced OT HVP
         ctx.cost_scale = float(cost_scale)  # For HVP
+        # OTDD label cost (HVP with labels not yet supported)
+        ctx.use_label_cost = (
+            label_x is not None and label_y is not None
+            and label_cost_matrix is not None and lambda_y != 0.0
+        )
         return gx, gy
 
     @staticmethod
@@ -115,6 +130,12 @@ class _SinkhornGradFn(torch.autograd.Function):
         if grad_grad_y is not None:
             raise NotImplementedError("Double backward w.r.t y is not implemented yet.")
 
+        if ctx.use_label_cost:
+            raise NotImplementedError(
+                "Double backward (HVP) is not supported with OTDD label-augmented cost. "
+                "Use gradient flow without HVP."
+            )
+
         out_x = None
         if grad_grad_x is not None:
             if grad_grad_x.shape != x.shape:
@@ -122,36 +143,42 @@ class _SinkhornGradFn(torch.autograd.Function):
             if not grad_grad_x.is_cuda:
                 raise ValueError("grad_grad_x must be a CUDA tensor.")
 
-            f_hat, g_hat = geomloss_to_ott_potentials(
-                f_grad, g_grad, a, b, eps=ctx.eps
-            )
-            hvp_x, _ = hvp_x_sqeuclid_from_potentials(
-                x,
-                y,
-                f_hat,
-                g_hat,
-                grad_grad_x,
-                eps=ctx.eps,
-                rho_x=ctx.rho_x,  # For semi-unbalanced OT HVP
-                rho_y=ctx.rho_y,  # For semi-unbalanced OT HVP
-                cost_scale=ctx.cost_scale,  # Cost scaling for half cost
-                tau2=ctx.hvp_tau2,
-                max_cg_iter=ctx.hvp_max_cg_iter,
-                cg_rtol=ctx.hvp_cg_rtol,
-                cg_atol=ctx.hvp_cg_atol,
-                cg_stabilise_every=ctx.hvp_cg_stabilise_every,
-                preconditioner=ctx.hvp_preconditioner,
-                precond_terms=ctx.hvp_precond_terms,
-                use_preconditioner=ctx.hvp_use_preconditioner,
-                allow_tf32=False,  # HVP requires full fp32 precision, TF32 causes numerical instability
-                use_exp2=ctx.use_exp2,
-                block_m=ctx.block_m,
-                block_n=ctx.block_n,
-                block_k=ctx.block_k,
-                num_warps=int(ctx.num_warps or 4),
-                num_stages=ctx.num_stages,
-            )
-            out_x = hvp_x * grad_scale
+            # Use no_grad to prevent autograd from tracking tensor operations
+            # during backward. Triton autotune mutates tensor metadata (version
+            # counter), which triggers unnecessary autograd bookkeeping without
+            # this guard.
+            # Follows FlashAttention's pattern (flash_attn_func.py line 1040).
+            with torch.no_grad():
+                f_hat, g_hat = geomloss_to_ott_potentials(
+                    f_grad, g_grad, a, b, eps=ctx.eps
+                )
+                hvp_x, _ = hvp_x_sqeuclid_from_potentials(
+                    x,
+                    y,
+                    f_hat,
+                    g_hat,
+                    grad_grad_x,
+                    eps=ctx.eps,
+                    rho_x=ctx.rho_x,  # For semi-unbalanced OT HVP
+                    rho_y=ctx.rho_y,  # For semi-unbalanced OT HVP
+                    cost_scale=ctx.cost_scale,  # Cost scaling for half cost
+                    tau2=ctx.hvp_tau2,
+                    max_cg_iter=ctx.hvp_max_cg_iter,
+                    cg_rtol=ctx.hvp_cg_rtol,
+                    cg_atol=ctx.hvp_cg_atol,
+                    cg_stabilise_every=ctx.hvp_cg_stabilise_every,
+                    preconditioner=ctx.hvp_preconditioner,
+                    precond_terms=ctx.hvp_precond_terms,
+                    use_preconditioner=ctx.hvp_use_preconditioner,
+                    allow_tf32=False,  # HVP requires full fp32 precision, TF32 causes numerical instability
+                    use_exp2=ctx.use_exp2,
+                    block_m=ctx.block_m,
+                    block_n=ctx.block_n,
+                    block_k=ctx.block_k,
+                    num_warps=int(ctx.num_warps or 4),
+                    num_stages=ctx.num_stages,
+                )
+                out_x = hvp_x * grad_scale
 
         # Inputs: x,y,a,b,f_grad,g_grad,eps,allow_tf32,use_exp2,autotune,
         # block_m,block_n,block_k,num_warps,num_stages,grad_scale,
@@ -372,7 +399,8 @@ class SamplesLoss(torch.nn.Module):
       Supports all features: debiasing, unbalanced OT, epsilon scaling, label cost.
     - `backend="alternating"`: OTT-JAX-style alternating Sinkhorn loop (Gauss-Seidel).
       Matches OTT-JAX's `update_potential` exactly. Requires fixed eps and n_iters.
-      Does NOT support: debiasing, unbalanced OT, epsilon scaling, or label cost.
+      Supports: debiasing, unbalanced/semi-unbalanced OT.
+      Does NOT support: epsilon scaling or label cost.
 
     The implementation returns either:
     - a scalar OT cost (default), or
@@ -391,6 +419,42 @@ class SamplesLoss(torch.nn.Module):
 
     Semi-unbalanced OT is useful when one distribution is trusted (e.g., a fixed
     reference) while the other may have mass differences or outliers.
+
+    OTDD Label-Augmented Cost
+    -------------------------
+    For OTDD-style dataset distance computation, supports augmented cost:
+
+        C[i,j] = lambda_x * ||x_i - y_j||² + lambda_y * W[label_i, label_j]
+
+    Where W is a precomputed (V × V) label-to-label distance matrix.
+
+    Example:
+        loss = SamplesLoss(
+            loss='sinkhorn', blur=0.316, half_cost=True,
+            label_cost_matrix=W,  # (V, V) label distances
+            lambda_x=1.0,         # Feature weight
+            lambda_y=1.0,         # Label weight
+        )
+        dist = loss(x, y, label_x=labels_x, label_y=labels_y)
+
+    Note: Gradients w.r.t. x and y are supported (for gradient flows).
+    Double backward (HVP) is not yet supported with label cost.
+
+    FlashSinkhorn (Shifted Potentials)
+    ----------------------------------
+    Set `use_flashstyle=True` to use the new FlashSinkhorn kernels, which offer:
+    - 67% fewer memory loads per iteration (via shifted potential formulation)
+    - 7-34% speedup at n >= 10,000, regardless of iteration count
+    - Break-even at n=5,000 with ~100 iterations; overhead at fewer iterations
+    - Recommended for large-scale OT (n >= 10,000)
+
+    FlashSinkhorn currently does NOT support:
+    - Debiased Sinkhorn divergence (debias=True)
+    - Unbalanced OT (reach parameter)
+    - OTDD label-augmented cost
+    - last_extrapolation=True (always uses final potentials)
+
+    Use `use_flashstyle=False` (default) for these features.
 
     Notes
     -----
@@ -436,9 +500,15 @@ class SamplesLoss(torch.nn.Module):
         hvp_preconditioner: str = "none",
         hvp_precond_terms: int = 3,
         hvp_use_preconditioner: bool = True,
+        # OTDD label-augmented cost parameters
+        label_cost_matrix: Optional[torch.Tensor] = None,
+        lambda_x: float = 1.0,
+        lambda_y: float = 0.0,
         # Early stopping parameters (like OTT-JAX)
         threshold: Optional[float] = None,  # Convergence threshold (None = no early stopping)
         inner_iterations: int = 10,  # Check convergence every N iterations (like OTT-JAX)
+        # FlashSinkhorn: use new shifted-potential kernels (67% fewer loads)
+        use_flashstyle: bool = True,  # Default True: uses FlashSinkhorn kernels (faster)
     ):
         super().__init__()
 
@@ -462,15 +532,11 @@ class SamplesLoss(torch.nn.Module):
                 raise ValueError(
                     'backend="alternating" requires eps and n_iters to be specified.'
                 )
-            if debias:
+            # NOTE: debias and unbalanced OT are now supported for alternating backend
+            if label_cost_matrix is not None:
                 raise ValueError(
-                    'backend="alternating" does not support debias=True. '
-                    'Use backend="symmetric" for debiased Sinkhorn.'
-                )
-            if reach is not None or reach_x is not None or reach_y is not None:
-                raise ValueError(
-                    'backend="alternating" does not support unbalanced OT. '
-                    'Use backend="symmetric" for unbalanced/semi-unbalanced OT.'
+                    'backend="alternating" does not support OTDD label cost. '
+                    'Use backend="symmetric" for label-augmented cost.'
                 )
         # Validate reach parameters
         if reach is not None and reach <= 0:
@@ -539,14 +605,17 @@ class SamplesLoss(torch.nn.Module):
         self.hvp_precond_terms = int(hvp_precond_terms)
         self.hvp_use_preconditioner = bool(hvp_use_preconditioner)
 
-        # Label cost disabled in public release (hardcoded defaults)
-        self.label_cost_matrix = None
-        self.lambda_x = 1.0
-        self.lambda_y = 0.0
+        # OTDD label-augmented cost: C[i,j] = lambda_x * ||x_i - y_j||² + lambda_y * W[label_i, label_j]
+        self.label_cost_matrix = label_cost_matrix  # W: (V, V) label distance matrix
+        self.lambda_x = float(lambda_x)  # Weight for Euclidean cost
+        self.lambda_y = float(lambda_y)  # Weight for label cost
 
         # Early stopping (like OTT-JAX)
         self.threshold = None if threshold is None else float(threshold)
         self.inner_iterations = int(inner_iterations)
+
+        # FlashSinkhorn: use new shifted-potential kernels
+        self.use_flashstyle = bool(use_flashstyle)
 
     def _eps_list_for_inputs(self, x: torch.Tensor, y: torch.Tensor) -> Sequence[float]:
         if self.eps_list is not None:
@@ -572,12 +641,14 @@ class SamplesLoss(torch.nn.Module):
     def forward(
         self,
         *args: Union[torch.Tensor, float],
+        label_x: Optional[torch.Tensor] = None,
+        label_y: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         parsed = _process_args(*args, normalize=self.normalize)
 
-        # Label tensors disabled in public release
-        _label_x = None
-        _label_y = None
+        # Store label tensors for use in nested function
+        _label_x = label_x
+        _label_y = label_y
 
         if not parsed.x.is_cuda or not parsed.y.is_cuda:
             raise ValueError("ot_triton.SamplesLoss requires CUDA tensors.")
@@ -603,37 +674,59 @@ class SamplesLoss(torch.nn.Module):
             ) -> torch.Tensor:
                 # OTT backend: use alternating-update Sinkhorn (matches OTT-JAX)
                 if self.backend == "alternating":
-                    loga = log_weights(a).contiguous()
-                    logb = log_weights(b).contiguous()
                     eps = float(eps_list[-1])  # Fixed eps for OTT backend
                     n_iters = len(eps_list)
 
-                    f_cost, g_cost = sinkhorn_ott_potentials_sqeuclid(
-                        x,
-                        y,
-                        loga,
-                        logb,
-                        eps,
-                        n_iters,
-                        autotune=autotune,
-                        allow_tf32=allow_tf32,
-                        use_exp2=use_exp2,
-                        block_m=block_m,
-                        block_n=block_n,
-                        block_k=block_k,
-                        num_warps=num_warps,
-                        num_stages=num_stages,
-                    )
-                    # CRITICAL: Convert OTT potentials to GeomLoss convention for gradient kernel.
-                    # OTT potentials: f_ott = eps*log(a) - LSE, g_ott = eps*log(b) - LSE
-                    # GeomLoss gradient kernel expects: f_geo, g_geo (without marginal weights baked in)
-                    # The kernel computes: exp((g - C)/eps) * b, so adding logb again would double-count.
-                    f_grad, g_grad = ott_to_geomloss_potentials(f_cost, g_cost, a, b, eps=eps)
+                    if self.use_flashstyle:
+                        # NEW: FlashSinkhorn alternating (shifted potentials, 67% fewer loads)
+                        # Note: FlashSinkhorn uses internal autotuning, doesn't expose block sizes
+                        # Supports semi-unbalanced OT via reach_x/reach_y
+                        f_cost, g_cost = sinkhorn_flashstyle_alternating(
+                            x,
+                            y,
+                            a,
+                            b,
+                            eps=eps,
+                            n_iters=n_iters,
+                            cost_scale=self.cost_scale,
+                            reach_x=self.reach_x,
+                            reach_y=self.reach_y,
+                            autotune=autotune,
+                            allow_tf32=allow_tf32,
+                            use_exp2=use_exp2,
+                        )
+                        # FlashSinkhorn returns GeomLoss-convention potentials directly
+                        f_grad, g_grad = f_cost, g_cost
+                    else:
+                        # OLD: OTT-style alternating Sinkhorn
+                        loga = log_weights(a).contiguous()
+                        logb = log_weights(b).contiguous()
+                        f_cost, g_cost = sinkhorn_ott_potentials_sqeuclid(
+                            x,
+                            y,
+                            loga,
+                            logb,
+                            eps,
+                            n_iters,
+                            autotune=autotune,
+                            allow_tf32=allow_tf32,
+                            use_exp2=use_exp2,
+                            block_m=block_m,
+                            block_n=block_n,
+                            block_k=block_k,
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+                        # CRITICAL: Convert OTT potentials to GeomLoss convention for gradient kernel.
+                        # OTT potentials: f_ott = eps*log(a) - LSE, g_ott = eps*log(b) - LSE
+                        # GeomLoss gradient kernel expects: f_geo, g_geo (without marginal weights baked in)
+                        # The kernel computes: exp((g - C)/eps) * b, so adding logb again would double-count.
+                        f_grad, g_grad = ott_to_geomloss_potentials(f_cost, g_cost, a, b, eps=eps)
 
                     ctx.save_for_backward(x, y, a, b, f_cost, g_cost, f_grad, g_grad)
                     ctx.eps = eps
-                    ctx.rho_x = None  # OTT backend is balanced only
-                    ctx.rho_y = None
+                    ctx.rho_x = self.rho_x  # Semi-unbalanced OT now supported
+                    ctx.rho_y = self.rho_y
                     ctx.allow_tf32 = bool(allow_tf32)
                     ctx.use_exp2 = bool(use_exp2)
                     ctx.autotune = bool(autotune)
@@ -642,12 +735,78 @@ class SamplesLoss(torch.nn.Module):
                     ctx.block_k = block_k
                     ctx.num_warps = num_warps
                     ctx.num_stages = int(num_stages)
+                    ctx.label_x = None
+                    ctx.label_y = None
+                    ctx.label_cost_matrix_stored = None
+                    ctx.lambda_x = 1.0
+                    ctx.lambda_y = 0.0
 
                     # Balanced OT cost: <a, f> + <b, g>
                     return (a * f_cost).sum() + (b * g_cost).sum()
 
                 # GeomLoss backend (default): symmetric-update Sinkhorn
-                if last_extrapolation:
+                if self.use_flashstyle:
+                    # FlashSinkhorn symmetric (shifted potentials, 67% fewer loads)
+                    # Now supports: last_extrapolation, OTDD label cost, unbalanced OT
+                    if last_extrapolation:
+                        f_cost, g_cost, f_grad, g_grad = sinkhorn_flashstyle_symmetric(
+                            x,
+                            y,
+                            a,
+                            b,
+                            blur=self.blur,
+                            scaling=self.scaling,
+                            use_epsilon_scaling=self.use_epsilon_scaling,
+                            eps=self.eps,
+                            n_iters=self.n_iters,
+                            allow_tf32=allow_tf32,
+                            use_exp2=use_exp2,
+                            autotune=autotune,
+                            cost_scale=self.cost_scale,
+                            rho_x=self.rho_x,
+                            rho_y=self.rho_y,
+                            last_extrapolation=True,
+                            return_prelast=True,
+                            # OTDD label-augmented cost
+                            label_x=_label_x,
+                            label_y=_label_y,
+                            label_cost_matrix=self.label_cost_matrix,
+                            lambda_x=self.lambda_x,
+                            lambda_y=self.lambda_y,
+                            # Early stopping
+                            threshold=self.threshold,
+                            check_every=self.inner_iterations,
+                        )
+                    else:
+                        f_cost, g_cost = sinkhorn_flashstyle_symmetric(
+                            x,
+                            y,
+                            a,
+                            b,
+                            blur=self.blur,
+                            scaling=self.scaling,
+                            use_epsilon_scaling=self.use_epsilon_scaling,
+                            eps=self.eps,
+                            n_iters=self.n_iters,
+                            allow_tf32=allow_tf32,
+                            use_exp2=use_exp2,
+                            autotune=autotune,
+                            cost_scale=self.cost_scale,
+                            rho_x=self.rho_x,
+                            rho_y=self.rho_y,
+                            last_extrapolation=False,
+                            # OTDD label-augmented cost
+                            label_x=_label_x,
+                            label_y=_label_y,
+                            label_cost_matrix=self.label_cost_matrix,
+                            lambda_x=self.lambda_x,
+                            lambda_y=self.lambda_y,
+                            # Early stopping
+                            threshold=self.threshold,
+                            check_every=self.inner_iterations,
+                        )
+                        f_grad, g_grad = f_cost, g_cost
+                elif last_extrapolation:
                     f_cost, g_cost, f_grad, g_grad = sinkhorn_geomloss_online_potentials_sqeuclid(
                         x,
                         y,
@@ -732,6 +891,12 @@ class SamplesLoss(torch.nn.Module):
                 ctx.block_k = block_k
                 ctx.num_warps = num_warps
                 ctx.num_stages = int(num_stages)
+                # OTDD label-augmented cost (stored for backward pass)
+                ctx.label_x = _label_x
+                ctx.label_y = _label_y
+                ctx.label_cost_matrix_stored = self.label_cost_matrix
+                ctx.lambda_x = self.lambda_x
+                ctx.lambda_y = self.lambda_y
 
                 # Cost computation: differs for balanced vs unbalanced/semi-unbalanced OT
                 # Note: With epsilon_schedule matching GeomLoss exactly, potentials match
@@ -808,6 +973,12 @@ class SamplesLoss(torch.nn.Module):
                         ctx.rho_x,  # For semi-unbalanced OT HVP
                         ctx.rho_y,  # For semi-unbalanced OT HVP
                         self.cost_scale,  # Cost scale for half cost
+                        # OTDD label-augmented cost
+                        ctx.label_x,
+                        ctx.label_y,
+                        ctx.label_cost_matrix_stored,
+                        ctx.lambda_x,
+                        ctx.lambda_y,
                     )
                     grad_x = gx if x.requires_grad else None
                     grad_y = gy if y.requires_grad else None
@@ -967,60 +1138,108 @@ class SamplesLoss(torch.nn.Module):
         if self.potentials:
             eps_list = tuple(self._eps_list_for_inputs(parsed.x, parsed.y))
             if self.backend == "alternating":
-                # OTT backend: use alternating-update Sinkhorn
-                loga = log_weights(parsed.a).contiguous()
-                logb = log_weights(parsed.b).contiguous()
                 eps = float(eps_list[-1])
                 n_iters = len(eps_list)
-                f, g = sinkhorn_ott_potentials_sqeuclid(
-                    parsed.x,
-                    parsed.y,
-                    loga,
-                    logb,
-                    eps,
-                    n_iters,
-                    autotune=self.autotune,
-                    allow_tf32=self.allow_tf32,
-                    use_exp2=self.use_exp2,
-                    block_m=self.block_m,
-                    block_n=self.block_n,
-                    block_k=self.block_k,
-                    num_warps=self.num_warps,
-                    num_stages=self.num_stages,
-                )
+                if self.use_flashstyle:
+                    # NEW: FlashSinkhorn alternating (supports semi-unbalanced OT)
+                    f, g = sinkhorn_flashstyle_alternating(
+                        parsed.x,
+                        parsed.y,
+                        parsed.a,
+                        parsed.b,
+                        eps=eps,
+                        n_iters=n_iters,
+                        cost_scale=self.cost_scale,
+                        reach_x=self.reach_x,
+                        reach_y=self.reach_y,
+                        autotune=self.autotune,
+                        allow_tf32=self.allow_tf32,
+                        use_exp2=self.use_exp2,
+                    )
+                else:
+                    # OLD: OTT-style alternating Sinkhorn
+                    loga = log_weights(parsed.a).contiguous()
+                    logb = log_weights(parsed.b).contiguous()
+                    f, g = sinkhorn_ott_potentials_sqeuclid(
+                        parsed.x,
+                        parsed.y,
+                        loga,
+                        logb,
+                        eps,
+                        n_iters,
+                        autotune=self.autotune,
+                        allow_tf32=self.allow_tf32,
+                        use_exp2=self.use_exp2,
+                        block_m=self.block_m,
+                        block_n=self.block_n,
+                        block_k=self.block_k,
+                        num_warps=self.num_warps,
+                        num_stages=self.num_stages,
+                    )
             else:
                 # GeomLoss backend (default): symmetric-update Sinkhorn
-                f, g = sinkhorn_geomloss_online_potentials_sqeuclid(
-                    parsed.x,
-                    parsed.y,
-                    parsed.a,
-                    parsed.b,
-                    blur=self.blur,
-                    scaling=self.scaling,
-                    use_epsilon_scaling=False,
-                    last_extrapolation=self.last_extrapolation,
-                    allow_tf32=self.allow_tf32,
-                    use_exp2=self.use_exp2,
-                    eps_list=eps_list,
-                    rho_x=self.rho_x,
-                    rho_y=self.rho_y,
-                    block_m=self.block_m,
-                    block_n=self.block_n,
-                    block_k=self.block_k,
-                    num_warps=self.num_warps,
-                    num_stages=self.num_stages,
-                    autotune=self.autotune,
-                    cost_scale=self.cost_scale,
-                    # OTDD label-augmented cost
-                    label_x=_label_x,
-                    label_y=_label_y,
-                    label_cost_matrix=self.label_cost_matrix,
-                    lambda_x=self.lambda_x,
-                    lambda_y=self.lambda_y,
-                    # Early stopping
-                    threshold=self.threshold,
-                    check_every=self.inner_iterations,
-                )
+                if self.use_flashstyle:
+                    # FlashSinkhorn symmetric (supports all features)
+                    f, g = sinkhorn_flashstyle_symmetric(
+                        parsed.x,
+                        parsed.y,
+                        parsed.a,
+                        parsed.b,
+                        blur=self.blur,
+                        scaling=self.scaling,
+                        use_epsilon_scaling=self.use_epsilon_scaling,
+                        eps=self.eps,
+                        n_iters=self.n_iters,
+                        allow_tf32=self.allow_tf32,
+                        use_exp2=self.use_exp2,
+                        autotune=self.autotune,
+                        cost_scale=self.cost_scale,
+                        rho_x=self.rho_x,
+                        rho_y=self.rho_y,
+                        last_extrapolation=self.last_extrapolation,
+                        # OTDD label-augmented cost
+                        label_x=_label_x,
+                        label_y=_label_y,
+                        label_cost_matrix=self.label_cost_matrix,
+                        lambda_x=self.lambda_x,
+                        lambda_y=self.lambda_y,
+                        # Early stopping
+                        threshold=self.threshold,
+                        check_every=self.inner_iterations,
+                    )
+                else:
+                    # OLD: GeomLoss-style symmetric Sinkhorn
+                    f, g = sinkhorn_geomloss_online_potentials_sqeuclid(
+                        parsed.x,
+                        parsed.y,
+                        parsed.a,
+                        parsed.b,
+                        blur=self.blur,
+                        scaling=self.scaling,
+                        use_epsilon_scaling=False,
+                        last_extrapolation=self.last_extrapolation,
+                        allow_tf32=self.allow_tf32,
+                        use_exp2=self.use_exp2,
+                        eps_list=eps_list,
+                        rho_x=self.rho_x,
+                        rho_y=self.rho_y,
+                        block_m=self.block_m,
+                        block_n=self.block_n,
+                        block_k=self.block_k,
+                        num_warps=self.num_warps,
+                        num_stages=self.num_stages,
+                        autotune=self.autotune,
+                        cost_scale=self.cost_scale,
+                        # OTDD label-augmented cost
+                        label_x=_label_x,
+                        label_y=_label_y,
+                        label_cost_matrix=self.label_cost_matrix,
+                        lambda_x=self.lambda_x,
+                        lambda_y=self.lambda_y,
+                        # Early stopping
+                        threshold=self.threshold,
+                        check_every=self.inner_iterations,
+                    )
             return f.view(parsed.a_view_shape), g.view(parsed.b_view_shape)
 
         return _cost(parsed.x, parsed.y, parsed.a, parsed.b)

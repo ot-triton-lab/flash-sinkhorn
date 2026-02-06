@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ot_triton.kernels._common import _cache_key_bucket
 from ot_triton.kernels.sinkhorn_triton_geomloss_sqeuclid import log_weights
 
 
@@ -60,18 +61,19 @@ def _grad_large_d_autotune_configs() -> Sequence[triton.Config]:
                 if block_k > block_d:
                     continue  # BLOCK_K must be <= BLOCK_D
                 for num_warps in (4, 8):
-                    configs.append(
-                        triton.Config(
-                            {
-                                "BLOCK_M": block_m,
-                                "BLOCK_N": block_n,
-                                "BLOCK_D": block_d,
-                                "BLOCK_K": block_k,
-                            },
-                            num_warps=num_warps,
-                            num_stages=2,
+                    for num_stages in (2, 3):  # Include stages=3 for large d
+                        configs.append(
+                            triton.Config(
+                                {
+                                    "BLOCK_M": block_m,
+                                    "BLOCK_N": block_n,
+                                    "BLOCK_D": block_d,
+                                    "BLOCK_K": block_k,
+                                },
+                                num_warps=num_warps,
+                                num_stages=num_stages,
+                            )
                         )
-                    )
     # Config 2: Smaller blocks for very large d (>1024)
     for block_m, block_n in ((32, 32), (32, 64)):
         for block_d in (128, 256):
@@ -79,18 +81,19 @@ def _grad_large_d_autotune_configs() -> Sequence[triton.Config]:
                 if block_k > block_d:
                     continue
                 for num_warps in (4, 8):
-                    configs.append(
-                        triton.Config(
-                            {
-                                "BLOCK_M": block_m,
-                                "BLOCK_N": block_n,
-                                "BLOCK_D": block_d,
-                                "BLOCK_K": block_k,
-                            },
-                            num_warps=num_warps,
-                            num_stages=2,
+                    for num_stages in (2, 3):  # Include stages=3 for large d
+                        configs.append(
+                            triton.Config(
+                                {
+                                    "BLOCK_M": block_m,
+                                    "BLOCK_N": block_n,
+                                    "BLOCK_D": block_d,
+                                    "BLOCK_K": block_k,
+                                },
+                                num_warps=num_warps,
+                                num_stages=num_stages,
+                            )
                         )
-                    )
     return configs
 
 
@@ -137,6 +140,8 @@ def _geomloss_grad_sqeuclid_impl(
     cost_scale,  # Cost scaling: 1.0 for full ||x-y||², 0.5 for half ||x-y||²/2
     lambda_x,    # Weight for Euclidean cost (default 1.0)
     lambda_y,    # Weight for label cost (default 0.0)
+    CACHE_KEY_N,     # Bucketed n for autotune cache (n // 32)
+    CACHE_KEY_M,     # Bucketed m for autotune cache (m // 32)
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
@@ -180,6 +185,7 @@ def _geomloss_grad_sqeuclid_impl(
         o = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
 
         for j0 in range(0, m, BLOCK_N):
+            j0 = tl.multiple_of(j0, BLOCK_N)
             offs_n = j0 + tl.arange(0, BLOCK_N)
             mask_n = offs_n < m
 
@@ -187,11 +193,13 @@ def _geomloss_grad_sqeuclid_impl(
                 g_ptr + offs_m[:, None] * 0 + offs_n[None, :] * stride_g,
                 mask=mask_m[:, None] & mask_n[None, :],
                 other=0.0,
+                eviction_policy="evict_first",
             ).to(tl.float32)
             logb = tl.load(
                 logb_ptr + offs_m[:, None] * 0 + offs_n[None, :] * stride_logb,
                 mask=mask_m[:, None] & mask_n[None, :],
                 other=-float("inf"),
+                eviction_policy="evict_first",
             ).to(tl.float32)
             if USE_EXP2:
                 logb = logb * log2e
@@ -200,10 +208,12 @@ def _geomloss_grad_sqeuclid_impl(
                 y2_ptr + offs_m[:, None] * 0 + offs_n[None, :] * stride_y2,
                 mask=mask_m[:, None] & mask_n[None, :],
                 other=0.0,
+                eviction_policy="evict_first",
             ).to(tl.float32)
 
             dot = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
             for k0 in range(0, D, BLOCK_K):
+                k0 = tl.multiple_of(k0, BLOCK_K)
                 offs_k = k0 + tl.arange(0, BLOCK_K)
                 mask_k = offs_k < D
                 xk = tl.load(
@@ -212,6 +222,7 @@ def _geomloss_grad_sqeuclid_impl(
                     + offs_k[None, :] * stride_x1,
                     mask=mask_m[:, None] & mask_k[None, :],
                     other=0.0,
+                    eviction_policy="evict_first",
                 )
                 yk = tl.load(
                     y_ptr
@@ -219,6 +230,7 @@ def _geomloss_grad_sqeuclid_impl(
                     + offs_k[:, None] * stride_y1,
                     mask=mask_n[None, :] & mask_k[:, None],
                     other=0.0,
+                    eviction_policy="evict_first",
                 )
                 dot += tl.dot(xk, yk, allow_tf32=ALLOW_TF32)
 
@@ -262,6 +274,7 @@ def _geomloss_grad_sqeuclid_impl(
                 y_ptr + offs_n[None, :] * stride_y0 + offs_d[:, None] * stride_y1,
                 mask=mask_d[:, None] & tl.broadcast_to(mask_n[None, :], (BLOCK_D, BLOCK_N)),
                 other=0.0,
+                eviction_policy="evict_first",
             ).to(tl.float32)
             yv = tl.trans(yv_t)
             o += tl.dot(w, yv, allow_tf32=ALLOW_TF32)
@@ -309,6 +322,7 @@ def _geomloss_grad_sqeuclid_impl(
     o = tl.zeros([BLOCK_N, BLOCK_D], tl.float32)
 
     for i0 in range(0, n, BLOCK_M):
+        i0 = tl.multiple_of(i0, BLOCK_M)
         offs_m = i0 + tl.arange(0, BLOCK_M)
         mask_m = offs_m < n
 
@@ -316,11 +330,13 @@ def _geomloss_grad_sqeuclid_impl(
             f_ptr + offs_m[:, None] * stride_f + offs_n[None, :] * 0,
             mask=mask_m[:, None] & mask_n[None, :],
             other=0.0,
+            eviction_policy="evict_first",
         ).to(tl.float32)
         loga = tl.load(
             loga_ptr + offs_m[:, None] * stride_loga + offs_n[None, :] * 0,
             mask=mask_m[:, None] & mask_n[None, :],
             other=-float("inf"),
+            eviction_policy="evict_first",
         ).to(tl.float32)
         if USE_EXP2:
             loga = loga * log2e
@@ -328,21 +344,25 @@ def _geomloss_grad_sqeuclid_impl(
             x2_ptr + offs_m[:, None] * stride_x2 + offs_n[None, :] * 0,
             mask=mask_m[:, None] & mask_n[None, :],
             other=0.0,
+            eviction_policy="evict_first",
         ).to(tl.float32)
 
         dot = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
         for k0 in range(0, D, BLOCK_K):
+            k0 = tl.multiple_of(k0, BLOCK_K)
             offs_k = k0 + tl.arange(0, BLOCK_K)
             mask_k = offs_k < D
             xk = tl.load(
                 x_ptr + offs_m[:, None] * stride_x0 + offs_k[None, :] * stride_x1,
                 mask=mask_m[:, None] & mask_k[None, :],
                 other=0.0,
+                eviction_policy="evict_first",
             )
             yk = tl.load(
                 y_ptr + offs_n[None, :] * stride_y0 + offs_k[:, None] * stride_y1,
                 mask=mask_n[None, :] & mask_k[:, None],
                 other=0.0,
+                eviction_policy="evict_first",
             )
             dot += tl.dot(xk, yk, allow_tf32=ALLOW_TF32)
 
@@ -386,6 +406,7 @@ def _geomloss_grad_sqeuclid_impl(
             x_ptr + offs_m[:, None] * stride_x0 + offs_d[None, :] * stride_x1,
             mask=mask_m[:, None] & mask_d[None, :],
             other=0.0,
+            eviction_policy="evict_first",
         ).to(tl.float32)
         o += tl.dot(tl.trans(w), xv, allow_tf32=ALLOW_TF32)
         m_j = new_m
@@ -451,6 +472,8 @@ def _geomloss_grad_sqeuclid_large_d_impl(
     cost_scale,  # Cost scaling: 1.0 for full ||x-y||², 0.5 for half ||x-y||²/2
     lambda_x,    # Weight for Euclidean cost (default 1.0)
     lambda_y,    # Weight for label cost (default 0.0)
+    CACHE_KEY_N,     # Bucketed n for autotune cache (n // 32)
+    CACHE_KEY_M,     # Bucketed m for autotune cache (m // 32)
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
@@ -481,6 +504,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
         ).to(tl.float32)
 
         for d0 in range(0, D, BLOCK_D):
+            d0 = tl.multiple_of(d0, BLOCK_D)
             offs_d = d0 + tl.arange(0, BLOCK_D)
             mask_d = offs_d < D
             tl.store(
@@ -495,6 +519,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
         l_i = tl.zeros([BLOCK_M], tl.float32)
 
         for j0 in range(0, m, BLOCK_N):
+            j0 = tl.multiple_of(j0, BLOCK_N)
             offs_n = j0 + tl.arange(0, BLOCK_N)
             mask_n = offs_n < m
 
@@ -502,11 +527,13 @@ def _geomloss_grad_sqeuclid_large_d_impl(
                 g_ptr + offs_m[:, None] * 0 + offs_n[None, :] * stride_g,
                 mask=mask_m[:, None] & mask_n[None, :],
                 other=0.0,
+                eviction_policy="evict_first",
             ).to(tl.float32)
             logb = tl.load(
                 logb_ptr + offs_m[:, None] * 0 + offs_n[None, :] * stride_logb,
                 mask=mask_m[:, None] & mask_n[None, :],
                 other=-float("inf"),
+                eviction_policy="evict_first",
             ).to(tl.float32)
             if USE_EXP2:
                 logb = logb * log2e
@@ -515,10 +542,12 @@ def _geomloss_grad_sqeuclid_large_d_impl(
                 y2_ptr + offs_m[:, None] * 0 + offs_n[None, :] * stride_y2,
                 mask=mask_m[:, None] & mask_n[None, :],
                 other=0.0,
+                eviction_policy="evict_first",
             ).to(tl.float32)
 
             dot = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
             for k0 in range(0, D, BLOCK_K):
+                k0 = tl.multiple_of(k0, BLOCK_K)
                 offs_k = k0 + tl.arange(0, BLOCK_K)
                 mask_k = offs_k < D
                 xk = tl.load(
@@ -527,6 +556,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
                     + offs_k[None, :] * stride_x1,
                     mask=mask_m[:, None] & mask_k[None, :],
                     other=0.0,
+                    eviction_policy="evict_first",
                 )
                 yk = tl.load(
                     y_ptr
@@ -534,6 +564,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
                     + offs_k[:, None] * stride_y1,
                     mask=mask_n[None, :] & mask_k[:, None],
                     other=0.0,
+                    eviction_policy="evict_first",
                 )
                 dot += tl.dot(xk, yk, allow_tf32=ALLOW_TF32)
 
@@ -573,6 +604,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
             l_i = l_i * alpha + tl.sum(w, axis=1)
 
             for d0 in range(0, D, BLOCK_D):
+                d0 = tl.multiple_of(d0, BLOCK_D)
                 offs_d = d0 + tl.arange(0, BLOCK_D)
                 mask_d = offs_d < D
                 o_tile = tl.load(
@@ -581,6 +613,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
                     + offs_d[None, :] * stride_grad_x1,
                     mask=mask_m[:, None] & mask_d[None, :],
                     other=0.0,
+                    eviction_policy="evict_last",
                 ).to(tl.float32)
                 yv_t = tl.load(
                     y_ptr
@@ -589,6 +622,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
                     mask=mask_d[:, None]
                     & tl.broadcast_to(mask_n[None, :], (BLOCK_D, BLOCK_N)),
                     other=0.0,
+                    eviction_policy="evict_first",
                 ).to(tl.float32)
                 yv = tl.trans(yv_t)
                 o_tile = o_tile * alpha[:, None] + tl.dot(w, yv, allow_tf32=ALLOW_TF32)
@@ -613,6 +647,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
             scale = (2.0 * cost_scale * grad_scale) * a
 
         for d0 in range(0, D, BLOCK_D):
+            d0 = tl.multiple_of(d0, BLOCK_D)
             offs_d = d0 + tl.arange(0, BLOCK_D)
             mask_d = offs_d < D
             o_tile = tl.load(
@@ -621,6 +656,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
                 + offs_d[None, :] * stride_grad_x1,
                 mask=mask_m[:, None] & mask_d[None, :],
                 other=0.0,
+                eviction_policy="evict_last",
             ).to(tl.float32)
             y_bar = o_tile / l_i_safe[:, None]
             x_tile = tl.load(
@@ -650,6 +686,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
     ).to(tl.float32)
 
     for d0 in range(0, D, BLOCK_D):
+        d0 = tl.multiple_of(d0, BLOCK_D)
         offs_d = d0 + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
         tl.store(
@@ -664,6 +701,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
     l_j = tl.zeros([BLOCK_N], tl.float32)
 
     for i0 in range(0, n, BLOCK_M):
+        i0 = tl.multiple_of(i0, BLOCK_M)
         offs_m = i0 + tl.arange(0, BLOCK_M)
         mask_m = offs_m < n
 
@@ -671,11 +709,13 @@ def _geomloss_grad_sqeuclid_large_d_impl(
             f_ptr + offs_m[:, None] * stride_f + offs_n[None, :] * 0,
             mask=mask_m[:, None] & mask_n[None, :],
             other=0.0,
+            eviction_policy="evict_first",
         ).to(tl.float32)
         loga = tl.load(
             loga_ptr + offs_m[:, None] * stride_loga + offs_n[None, :] * 0,
             mask=mask_m[:, None] & mask_n[None, :],
             other=-float("inf"),
+            eviction_policy="evict_first",
         ).to(tl.float32)
         if USE_EXP2:
             loga = loga * log2e
@@ -683,21 +723,25 @@ def _geomloss_grad_sqeuclid_large_d_impl(
             x2_ptr + offs_m[:, None] * stride_x2 + offs_n[None, :] * 0,
             mask=mask_m[:, None] & mask_n[None, :],
             other=0.0,
+            eviction_policy="evict_first",
         ).to(tl.float32)
 
         dot = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
         for k0 in range(0, D, BLOCK_K):
+            k0 = tl.multiple_of(k0, BLOCK_K)
             offs_k = k0 + tl.arange(0, BLOCK_K)
             mask_k = offs_k < D
             xk = tl.load(
                 x_ptr + offs_m[:, None] * stride_x0 + offs_k[None, :] * stride_x1,
                 mask=mask_m[:, None] & mask_k[None, :],
                 other=0.0,
+                eviction_policy="evict_first",
             )
             yk = tl.load(
                 y_ptr + offs_n[None, :] * stride_y0 + offs_k[:, None] * stride_y1,
                 mask=mask_n[None, :] & mask_k[:, None],
                 other=0.0,
+                eviction_policy="evict_first",
             )
             dot += tl.dot(xk, yk, allow_tf32=ALLOW_TF32)
 
@@ -737,6 +781,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
         l_j = l_j * alpha + tl.sum(w, axis=0)
 
         for d0 in range(0, D, BLOCK_D):
+            d0 = tl.multiple_of(d0, BLOCK_D)
             offs_d = d0 + tl.arange(0, BLOCK_D)
             mask_d = offs_d < D
             o_tile = tl.load(
@@ -745,11 +790,13 @@ def _geomloss_grad_sqeuclid_large_d_impl(
                 + offs_d[None, :] * stride_grad_y1,
                 mask=mask_n[:, None] & mask_d[None, :],
                 other=0.0,
+                eviction_policy="evict_last",
             ).to(tl.float32)
             xv = tl.load(
                 x_ptr + offs_m[:, None] * stride_x0 + offs_d[None, :] * stride_x1,
                 mask=mask_m[:, None] & mask_d[None, :],
                 other=0.0,
+                eviction_policy="evict_first",
             ).to(tl.float32)
             o_tile = o_tile * alpha[:, None] + tl.dot(tl.trans(w), xv, allow_tf32=ALLOW_TF32)
             tl.store(
@@ -771,6 +818,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
     else:
         scale = (2.0 * cost_scale * grad_scale) * b
     for d0 in range(0, D, BLOCK_D):
+        d0 = tl.multiple_of(d0, BLOCK_D)
         offs_d = d0 + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
         o_tile = tl.load(
@@ -779,6 +827,7 @@ def _geomloss_grad_sqeuclid_large_d_impl(
             + offs_d[None, :] * stride_grad_y1,
             mask=mask_n[:, None] & mask_d[None, :],
             other=0.0,
+            eviction_policy="evict_last",
         ).to(tl.float32)
         x_bar = o_tile / l_j_safe[:, None]
         y_t = tl.load(
@@ -883,14 +932,14 @@ def _max_block_m_for_smem(block_d: int, budget_kb: int = SHARED_MEM_BUDGET_KB) -
 
 _geomloss_grad_sqeuclid_autotune = triton.autotune(
     configs=_grad_autotune_configs(),
-    key=["D", "ALLOW_TF32", "DTYPE_ID"],
+    key=["CACHE_KEY_N", "CACHE_KEY_M", "D", "ALLOW_TF32", "DTYPE_ID"],
 )(_geomloss_grad_sqeuclid_impl)
 
 
 # Autotuned version of the large-D gradient kernel
 _geomloss_grad_sqeuclid_large_d_autotune = triton.autotune(
     configs=_grad_large_d_autotune_configs(),
-    key=["D", "ALLOW_TF32", "DTYPE_ID"],
+    key=["CACHE_KEY_N", "CACHE_KEY_M", "D", "ALLOW_TF32", "DTYPE_ID"],
 )(_geomloss_grad_sqeuclid_large_d_impl)
 
 
@@ -1142,6 +1191,8 @@ def sinkhorn_geomloss_online_grad_sqeuclid(
             float(cost_scale),
             float(lambda_x),
             float(lambda_y),
+            CACHE_KEY_N=_cache_key_bucket(n),
+            CACHE_KEY_M=_cache_key_bucket(m),
             D=d,
             BLOCK_D=block_d,
             ALLOW_TF32=allow_tf32,
@@ -1192,6 +1243,7 @@ def sinkhorn_geomloss_online_grad_sqeuclid(
             float(cost_scale),
             float(lambda_x),
             float(lambda_y),
+            _cache_key_bucket(n), _cache_key_bucket(m),
             D=d,
             BLOCK_D=block_d,
             ALLOW_TF32=allow_tf32,

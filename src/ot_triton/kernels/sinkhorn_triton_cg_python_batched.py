@@ -1,7 +1,7 @@
 """Python-level batched CG for HVP acceleration.
 
-This module implements a batched CG solver that uses the existing proven
-apply_plan_vec_sqeuclid kernels instead of inline Triton softmax.
+This module implements a batched CG solver that uses the FlashStyle
+apply_plan_vec_flashstyle kernels for improved performance and reduced memory usage.
 
 This avoids the mysterious Triton compilation state issues observed with
 the fully-inline batched CG kernel while still providing a clean interface
@@ -12,12 +12,13 @@ Includes a torch.compile-compatible version for additional speedup.
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
 import torch
 
-from ot_triton.kernels.sinkhorn_triton_apply_sqeuclid import apply_plan_vec_sqeuclid
+from ot_triton.kernels.sinkhorn_triton_apply_sqeuclid import apply_plan_vec_flashstyle
 
 
 @dataclass
@@ -108,18 +109,32 @@ def python_batched_cg_solve(
     x2 = x2.float().contiguous()
     y2 = y2.float().contiguous()
 
+    # Convert OTT-style potentials (f, g) to FlashStyle shifted potentials
+    # For balanced OT: log_a = log_b = -log(n) = -log(m) = const
+    log_a = torch.full((n,), -math.log(n), device=x.device, dtype=torch.float32)
+    log_b = torch.full((m,), -math.log(m), device=x.device, dtype=torch.float32)
+
+    # Compute squared norms for shifting
+    alpha = (x.float() ** 2).sum(dim=1)  # [n] = ||x||^2
+    beta = (y.float() ** 2).sum(dim=1)   # [m] = ||y||^2
+
+    # Shifted potentials: f_hat = f - alpha, g_hat = g - beta
+    # (using cost_scale=1.0 since we're working with full squared Euclidean cost)
+    f_hat = f - alpha
+    g_hat = g - beta
+
     # Define the linear operator
     def linear_op(z: torch.Tensor) -> torch.Tensor:
         """Compute H @ z = denom * z - P^T @ (P @ z / diag_x)"""
         # piz = P @ z (axis 1 reduction)
-        piz = apply_plan_vec_sqeuclid(
-            x, y, f, g, z,
-            eps=eps_f, axis=1, x2=x2, y2=y2, autotune=autotune,
+        piz = apply_plan_vec_flashstyle(
+            x, y, f_hat, g_hat, log_a, log_b, z,
+            eps=eps_f, axis=1, cost_scale=1.0, allow_tf32=False,
         )
         # P^T @ (piz / diag_x) (axis 0 reduction)
-        pt_piz_over_diag = apply_plan_vec_sqeuclid(
-            x, y, f, g, piz / diag_x,
-            eps=eps_f, axis=0, x2=x2, y2=y2, autotune=autotune,
+        pt_piz_over_diag = apply_plan_vec_flashstyle(
+            x, y, f_hat, g_hat, log_a, log_b, piz / diag_x,
+            eps=eps_f, axis=0, cost_scale=1.0, allow_tf32=False,
         )
         return denom * z - pt_piz_over_diag
 
@@ -205,6 +220,20 @@ def _create_compiled_cg_core(max_iter: int):
             r: Final residual vector (m,)
             r0_norm_sq: Initial residual norm squared (scalar tensor)
         """
+        # Convert OTT-style potentials (f, g) to FlashStyle shifted potentials
+        n, d = x.shape
+        m = y.shape[0]
+        log_a = torch.full((n,), -math.log(n), device=x.device, dtype=torch.float32)
+        log_b = torch.full((m,), -math.log(m), device=x.device, dtype=torch.float32)
+
+        # Compute squared norms for shifting
+        alpha = (x.float() ** 2).sum(dim=1)  # [n]
+        beta = (y.float() ** 2).sum(dim=1)   # [m]
+
+        # Shifted potentials: f_hat = f - alpha, g_hat = g - beta
+        f_hat = f - alpha
+        g_hat = g - beta
+
         # Initialize CG state
         sol = torch.zeros_like(rhs)
         r = rhs.clone()
@@ -215,13 +244,13 @@ def _create_compiled_cg_core(max_iter: int):
         # Fixed iteration CG loop
         for _ in range(max_iter):
             # Compute Ap = H @ p = denom * p - P^T @ (P @ p / diag_x)
-            piz = apply_plan_vec_sqeuclid(
-                x, y, f, g, p,
-                eps=eps, axis=1, x2=x2, y2=y2, autotune=False,
+            piz = apply_plan_vec_flashstyle(
+                x, y, f_hat, g_hat, log_a, log_b, p,
+                eps=eps, axis=1, cost_scale=1.0, allow_tf32=False,
             )
-            pt_piz_over_diag = apply_plan_vec_sqeuclid(
-                x, y, f, g, piz / diag_x,
-                eps=eps, axis=0, x2=x2, y2=y2, autotune=False,
+            pt_piz_over_diag = apply_plan_vec_flashstyle(
+                x, y, f_hat, g_hat, log_a, log_b, piz / diag_x,
+                eps=eps, axis=0, cost_scale=1.0, allow_tf32=False,
             )
             Ap = denom * p - pt_piz_over_diag
 
@@ -229,25 +258,25 @@ def _create_compiled_cg_core(max_iter: int):
             pAp = torch.dot(p, Ap)
 
             # Safe division (avoid NaN if pAp is tiny)
-            alpha = torch.where(
+            alpha_step = torch.where(
                 pAp.abs() > 1e-15,
                 rz_old / pAp,
                 torch.zeros_like(pAp)
             )
 
-            sol = sol + alpha * p
-            r = r - alpha * Ap
+            sol = sol + alpha_step * p
+            r = r - alpha_step * Ap
 
             rz_new = torch.dot(r, r)
 
             # Safe division for beta
-            beta = torch.where(
+            beta_step = torch.where(
                 rz_old.abs() > 1e-15,
                 rz_new / rz_old,
                 torch.zeros_like(rz_old)
             )
 
-            p = r + beta * p
+            p = r + beta_step * p
             rz_old = rz_new
 
         return sol, r, r0_norm_sq

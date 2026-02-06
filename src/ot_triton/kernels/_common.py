@@ -6,6 +6,16 @@ import numpy as np
 import torch
 
 
+def _cache_key_bucket(size: int, bucket: int = 32) -> int:
+    """Bucket a problem size for Triton autotune cache keys.
+
+    Follows FlashAttention's seqlen // 32 pattern (Dao et al.).
+    Groups nearby sizes to limit recompilations while still
+    differentiating small vs large problems.
+    """
+    return size // bucket
+
+
 def dampening(eps: float, rho: Optional[float]) -> float:
     """Compute dampening factor for unbalanced OT with KL marginal penalties.
 

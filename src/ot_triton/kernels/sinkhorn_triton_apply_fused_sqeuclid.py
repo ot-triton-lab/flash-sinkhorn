@@ -15,6 +15,7 @@ when the grid size would be too large.
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -22,7 +23,8 @@ import triton
 import triton.language as tl
 
 # Import the non-fused implementation for fallback
-from ot_triton.kernels.sinkhorn_triton_apply_sqeuclid import apply_plan_vec_sqeuclid
+from ot_triton.kernels.sinkhorn_triton_apply_sqeuclid import apply_plan_vec_flashstyle
+from ot_triton.kernels.sinkhorn_flashstyle_sqeuclid import standard_to_shifted_potentials
 
 
 def _get_max_resident_blocks(device: torch.device) -> int:
@@ -324,8 +326,8 @@ def fused_schur_matvec_sqeuclid(
     Args:
         x: Source points (n, d)
         y: Target points (m, d)
-        f: Source OTT-style potential (n,)
-        g: Target OTT-style potential (m,)
+        f: Source potential (n,) - OTT-style: P = exp((f+g-C)/eps)
+        g: Target potential (m,) - OTT-style: P = exp((f+g-C)/eps)
         z: Input CG vector (m,)
         diag_x: Source diagonal D_x = diag_factor_x * a_hat (n,)
         denom: Target denominator D_y = diag_factor_y * b_hat + eps*tau2 (m,)
@@ -342,7 +344,9 @@ def fused_schur_matvec_sqeuclid(
         This kernel uses a spin-wait barrier for grid-wide synchronization.
         The grid size must not exceed the number of co-resident blocks on the GPU.
         If the grid would be too large, this function automatically falls back to
-        a two-kernel approach (apply_plan_vec_sqeuclid axis=1, then axis=0).
+        a two-kernel approach using apply_plan_vec_flashstyle (axis=1, then axis=0).
+
+        The fallback path converts OTT potentials to shifted form and uses FlashStyle apply kernels.
     """
     if x.ndim != 2 or y.ndim != 2:
         raise ValueError("x and y must be (n,d) and (m,d).")
@@ -418,43 +422,50 @@ def fused_schur_matvec_sqeuclid(
     # If too large, fall back to two-kernel approach to avoid deadlock
     max_resident = _get_max_resident_blocks(x.device)
     if grid_size > max_resident:
-        # Fallback: use two separate kernels (no spin barrier deadlock risk)
+        # Fallback: use two separate FlashStyle kernels (no spin barrier deadlock risk)
+        # f, g are OTT-style potentials: P = exp((f+g-C)/eps)
+        # FlashStyle kernels expect shifted potentials + log_a, log_b
+        # Convert: OTT → shifted by subtracting squared norms
+        alpha = (x.float() ** 2).sum(dim=1)
+        beta = (y.float() ** 2).sum(dim=1)
+        f_shift = f - alpha
+        g_shift = g - beta
+
+        # OTT potentials already absorb log marginals (f_ott = f_geom + eps*log(a)),
+        # so use zeros to avoid double-counting
+        log_a = torch.zeros(n, device=x.device, dtype=torch.float32)
+        log_b = torch.zeros(m, device=x.device, dtype=torch.float32)
+
         # Phase 1: piz = P @ z (axis=1)
-        piz_result = apply_plan_vec_sqeuclid(
-            x, y, f, g, z,
+        piz_result = apply_plan_vec_flashstyle(
+            x, y, f_shift, g_shift, log_a, log_b, z,
             eps=eps_f,
             axis=1,
             cost_scale=1.0,
-            x2=x2,
-            y2=y2,
+            allow_tf32=allow_tf32,
+            use_exp2=use_exp2,
             block_m=block_m,
             block_n=block_n,
             block_k=block_k,
             num_warps=num_warps,
             num_stages=num_stages,
-            use_exp2=use_exp2,
-            allow_tf32=allow_tf32,
-            autotune=False,
         )
         # Phase 2: P^T @ (piz / diag_x) and compute final output
         # Guard against division by zero when diag_x underflows to 0
         diag_x_safe = diag_x.clamp(min=1e-40)
         scaled_piz = piz_result / diag_x_safe
-        pt_scaled_piz = apply_plan_vec_sqeuclid(
-            x, y, f, g, scaled_piz,
+        pt_scaled_piz = apply_plan_vec_flashstyle(
+            x, y, f_shift, g_shift, log_a, log_b, scaled_piz,
             eps=eps_f,
             axis=0,
             cost_scale=1.0,
-            x2=x2,
-            y2=y2,
+            allow_tf32=allow_tf32,
+            use_exp2=use_exp2,
             block_m=block_m,
             block_n=block_n,
             block_k=block_k,
             num_warps=num_warps,
             num_stages=num_stages,
-            use_exp2=use_exp2,
-            allow_tf32=allow_tf32,
-            autotune=False,
         )
         out = denom * z - pt_scaled_piz
         # Update piz_buffer for reuse
