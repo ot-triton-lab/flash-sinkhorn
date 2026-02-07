@@ -15,6 +15,11 @@ from ot_triton.hvp import (
     hvp_x_sqeuclid_from_potentials,
     inverse_hvp_x_sqeuclid_from_potentials,
 )
+from ot_triton.implicit_grad import (
+    ImplicitGradInfo,
+    implicit_grad_x,
+    implicit_grad_x_from_potentials,
+)
 
 __all__ = [
     "SamplesLoss",
@@ -25,6 +30,9 @@ __all__ = [
     "hvp_x_sqeuclid",
     "hvp_x_sqeuclid_from_potentials",
     "inverse_hvp_x_sqeuclid_from_potentials",
+    "ImplicitGradInfo",
+    "implicit_grad_x",
+    "implicit_grad_x_from_potentials",
     "__version__",
 ]
 __version__ = "0.3.0"

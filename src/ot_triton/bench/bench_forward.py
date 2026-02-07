@@ -14,7 +14,10 @@ Compares forward pass timing across dimensions:
 
 IMPORTANT:
 - TF32 is enabled by default for ~2x speedup on A100/H100 GPUs (uses Tensor Cores)
-- Sizes are run large->small to avoid Triton autotuning cache pollution
+- All kernels use bucketed autotune cache keys (CACHE_KEY = n // 32), so nearby
+  sizes share configs and cross-size cache pollution is minimal (~5% variance).
+  Subprocess isolation is no longer needed for most use cases.
+- Sizes are still run large->small as a best practice
 - Autotuning finds optimal block sizes; first call per (n,d) has ~2-3s overhead
 - Memory overhead note: First run at each config incurs ~256MB Triton compilation
   overhead. Subsequent runs use cached configs (~4MB steady-state). This explains
@@ -32,20 +35,23 @@ Timing methodology:
   (JAX lacks CUDA event API; wall-clock includes minor Python overhead ~1-5%)
 
 Usage:
-    # Default: d=3,8,64, TF32 enabled, online methods only
-    python -m ot_triton.bench.bench_paper_forward
+    # Default: d=3,8,64, TF32 enabled, online methods only (in-process)
+    python -m ot_triton.bench.bench_forward
 
     # Strict FP32 (slower but higher precision)
-    python -m ot_triton.bench.bench_paper_forward --no-tf32
+    python -m ot_triton.bench.bench_forward --no-tf32
 
     # Include tensorized/dense methods (small sizes only)
-    python -m ot_triton.bench.bench_paper_forward --tensorized --max-dense-size 20000
+    python -m ot_triton.bench.bench_forward --tensorized --max-dense-size 20000
 
     # Verify loss parity first, then benchmark
-    python -m ot_triton.bench.bench_paper_forward --verify
+    python -m ot_triton.bench.bench_forward --verify
 
     # Single dimension
-    python -m ot_triton.bench.bench_paper_forward --dims 64
+    python -m ot_triton.bench.bench_forward --dims 64
+
+    # Subprocess mode: still available for maximum isolation if needed
+    python -m ot_triton.bench.bench_forward --subprocess --dims 512
 """
 
 from __future__ import annotations
@@ -60,6 +66,9 @@ import argparse
 import csv
 import ctypes
 import gc
+import json
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -152,6 +161,22 @@ class JITOverheadResult:
     warm_ms: float        # Steady-state (average of subsequent calls)
     jit_overhead_ms: float  # cold_start - warm
     overhead_ratio: float   # cold_start / warm
+
+
+def timing_result_to_json(r: TimingResult) -> str:
+    """Serialize TimingResult to a JSON string (one line)."""
+    return json.dumps({
+        "method": r.method, "n": r.n, "m": r.m, "d": r.d, "eps": r.eps,
+        "mean_ms": r.mean_ms, "std_ms": r.std_ms, "min_ms": r.min_ms,
+        "max_ms": r.max_ms, "median_ms": r.median_ms,
+        "peak_memory_mb": r.peak_memory_mb, "oom": r.oom,
+    })
+
+
+def timing_result_from_json(line: str) -> TimingResult:
+    """Deserialize TimingResult from a JSON string."""
+    d = json.loads(line)
+    return TimingResult(**d)
 
 
 def bench_with_stats(
@@ -922,7 +947,8 @@ def run_forward_benchmark(
 ) -> List[TimingResult]:
     """Run forward pass benchmark.
 
-    Sizes are run large->small to avoid Triton cache pollution.
+    Sizes are run large->small as best practice. With bucketed autotune cache
+    keys (CACHE_KEY = n // 32), cross-size cache pollution is minimal.
 
     FlashSinkhorn backends:
     - flash_symmetric: GeomLoss-style symmetric updates (compare with GeomLoss)
@@ -1331,6 +1357,96 @@ def verify_loss_parity(
     return all_passed
 
 
+def run_forward_benchmark_subprocess(
+    sizes: List[int],
+    dims: List[int],
+    args: argparse.Namespace,
+) -> List[TimingResult]:
+    """Run forward benchmark with each (n, d) in a separate subprocess.
+
+    With bucketed autotune cache keys, in-process mode is accurate for most
+    use cases. Subprocess mode is still available for maximum isolation when
+    exact reproducibility across runs is critical (e.g., paper figures).
+
+    Args:
+        sizes: Problem sizes to benchmark (will be sorted large->small).
+        dims: Feature dimensions to benchmark.
+        args: Parsed CLI args (forwarded to worker subprocess).
+
+    Returns:
+        Collected TimingResult list from all subprocesses.
+    """
+    results: List[TimingResult] = []
+    sizes_sorted = sorted(sizes, reverse=True)
+
+    # Build the list of (d, n) pairs: dims outer, sizes inner (large->small)
+    pairs = [(d, n) for d in dims for n in sizes_sorted]
+    total = len(pairs)
+
+    for idx, (d, n) in enumerate(pairs, 1):
+        print(f"  [{idx}/{total}] n={n:>7d}, d={d:>3d} ...", end="", flush=True, file=sys.stderr)
+
+        # Build subprocess command, forwarding relevant flags
+        cmd = [
+            sys.executable, "-m", "ot_triton.bench.bench_forward",
+            "--single-size", str(n),
+            "--single-dim", str(d),
+            "--eps", str(args.eps),
+            "--n-iters", str(args.n_iters),
+            "--warmup", str(args.warmup),
+            "--rep", str(args.rep),
+        ]
+        if not args.tf32:
+            cmd.append("--no-tf32")
+        if args.no_flash_symmetric:
+            cmd.append("--no-flash-symmetric")
+        if args.no_flash_alternating:
+            cmd.append("--no-flash-alternating")
+        if args.no_geomloss:
+            cmd.append("--no-geomloss")
+        if args.no_ott:
+            cmd.append("--no-ott")
+        if args.tensorized:
+            cmd.extend(["--tensorized", "--max-dense-size", str(args.max_dense_size)])
+        if args.only is not None:
+            cmd.extend(["--only", args.only])
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+        if proc.returncode != 0:
+            print(f" FAILED (exit code {proc.returncode})", file=sys.stderr)
+            if proc.stderr.strip():
+                # Show last few lines of stderr for debugging
+                for line in proc.stderr.strip().splitlines()[-5:]:
+                    print(f"    {line}", file=sys.stderr)
+            continue
+
+        # Parse JSON lines from stdout
+        sub_results = []
+        for line in proc.stdout.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                sub_results.append(timing_result_from_json(line))
+            except (json.JSONDecodeError, TypeError) as e:
+                print(f" (parse error: {e})", end="", file=sys.stderr)
+
+        results.extend(sub_results)
+
+        # Print summary of timing for this size
+        parts = []
+        for r in sub_results:
+            if r.oom:
+                parts.append(f"{r.method}: OOM")
+            else:
+                parts.append(f"{r.method}: {r.mean_ms:.1f} ms")
+        summary = ", ".join(parts) if parts else "no results"
+        print(f" done ({summary})", file=sys.stderr)
+
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Unified forward pass benchmark for FlashSinkhorn paper."
@@ -1391,7 +1507,70 @@ def main() -> None:
         "--jit-dim", type=int, default=64,
         help="Feature dimension for JIT overhead measurement (default: 64)."
     )
+    parser.add_argument(
+        "--subprocess", action="store_true",
+        help="Run each size in a separate subprocess (rarely needed with bucketed cache keys)."
+    )
+    parser.add_argument(
+        "--single-size", type=int, default=None,
+        help=argparse.SUPPRESS,  # Hidden: used internally by --subprocess mode
+    )
+    parser.add_argument(
+        "--single-dim", type=int, default=None,
+        help=argparse.SUPPRESS,  # Hidden: used with --single-size
+    )
     args = parser.parse_args()
+
+    # =====================================================================
+    # Worker mode: benchmark a single (n, d) and emit JSON to stdout
+    # =====================================================================
+    if args.single_size is not None:
+        if args.single_dim is None:
+            parser.error("--single-dim is required with --single-size")
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA required for this benchmark.")
+
+        _preload_cuda_libs()
+        _set_tf32(args.tf32)
+        device = torch.device("cuda")
+
+        # Determine which methods to benchmark (same logic as normal mode)
+        include_flash_symmetric = not args.no_flash_symmetric
+        include_flash_alternating = not args.no_flash_alternating
+        include_geomloss = not args.no_geomloss
+        include_ott = not args.no_ott
+        include_tensorized = bool(args.tensorized)
+
+        if args.only is not None:
+            include_flash_symmetric = args.only in ("flash_symmetric", "flash")
+            include_flash_alternating = args.only in ("flash_alternating", "flash")
+            include_geomloss = args.only == "geomloss"
+            include_ott = args.only == "ott"
+            include_tensorized = False
+
+        results = run_forward_benchmark(
+            sizes=[args.single_size],
+            dims=[args.single_dim],
+            eps=args.eps,
+            n_iters=args.n_iters,
+            device=device,
+            warmup=args.warmup,
+            rep=args.rep,
+            include_flash_symmetric=include_flash_symmetric,
+            include_flash_alternating=include_flash_alternating,
+            include_ott=include_ott,
+            include_geomloss=include_geomloss,
+            include_tensorized=include_tensorized,
+            max_dense_size=args.max_dense_size,
+            verbose=False,
+            nvtx=False,
+            allow_tf32=args.tf32,
+        )
+
+        # Emit JSON lines to stdout for the orchestrator to parse
+        for r in results:
+            print(timing_result_to_json(r), flush=True)
+        return
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required for this benchmark.")
@@ -1468,7 +1647,10 @@ def main() -> None:
             print("Warning: Ignoring --tensorized because --only is set.")
             include_tensorized = False
 
-    print(f"Forward Pass Benchmark (Unified)")
+    mode_label = "Subprocess Mode" if args.subprocess else "In-Process (bucketed cache keys)"
+    print(f"Forward Pass Benchmark ({mode_label})")
+    if args.subprocess:
+        print(f"  Running each size in a separate subprocess for maximum isolation...")
     print(f"  Sizes: {sorted(sizes, reverse=True)} (large->small)")
     print(f"  Dimensions: {dims}")
     print(f"  Epsilon: {args.eps}")
@@ -1480,27 +1662,35 @@ def main() -> None:
     print(f"  Include tensorized: {args.tensorized} (max size: {args.max_dense_size})")
     if args.only is not None:
         print(f"  Only: {args.only}")
-    print(f"  NVTX ranges: {nvtx_enabled}")
+    if not args.subprocess:
+        print(f"  NVTX ranges: {nvtx_enabled}")
     print(f"  GPU: {torch.cuda.get_device_name()}")
 
-    results = run_forward_benchmark(
-        sizes=sizes,
-        dims=dims,
-        eps=args.eps,
-        n_iters=args.n_iters,
-        device=device,
-        warmup=args.warmup,
-        rep=args.rep,
-        include_flash_symmetric=include_flash_symmetric,
-        include_flash_alternating=include_flash_alternating,
-        include_ott=include_ott,
-        include_geomloss=include_geomloss,
-        include_tensorized=include_tensorized,
-        max_dense_size=args.max_dense_size,
-        verbose=not args.quiet,
-        nvtx=nvtx_enabled,
-        allow_tf32=args.tf32,
-    )
+    if args.subprocess:
+        results = run_forward_benchmark_subprocess(
+            sizes=sizes,
+            dims=dims,
+            args=args,
+        )
+    else:
+        results = run_forward_benchmark(
+            sizes=sizes,
+            dims=dims,
+            eps=args.eps,
+            n_iters=args.n_iters,
+            device=device,
+            warmup=args.warmup,
+            rep=args.rep,
+            include_flash_symmetric=include_flash_symmetric,
+            include_flash_alternating=include_flash_alternating,
+            include_ott=include_ott,
+            include_geomloss=include_geomloss,
+            include_tensorized=include_tensorized,
+            max_dense_size=args.max_dense_size,
+            verbose=not args.quiet,
+            nvtx=nvtx_enabled,
+            allow_tf32=args.tf32,
+        )
 
     output_dir = Path(args.output_dir)
     save_results_csv(results, output_dir / "forward_all.csv")
