@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ot_triton"
+name = "flash-sinkhorn"
 dynamic = ["version"]
 description = "Sinkhorn optimal transport kernels in PyTorch + Triton (squared Euclidean, no cost matrix materialization)."
 readme = "README.md"
@@ -30,8 +30,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ot-triton-lab/ot_triton"
-Repository = "https://github.com/ot-triton-lab/ot_triton"
+Homepage = "https://github.com/ot-triton-lab/flash-sinkhorn"
+Repository = "https://github.com/ot-triton-lab/flash-sinkhorn"
 
 [project.optional-dependencies]
 dev = [
@@ -50,8 +50,8 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.dynamic]
-version = {attr = "ot_triton.__version__"}
+version = {attr = "flash_sinkhorn.__version__"}
 
 [tool.pytest.ini_options]
 addopts = "-ra"
-testpaths = ["src/ot_triton/testing"]
+testpaths = ["src/flash_sinkhorn/testing"]

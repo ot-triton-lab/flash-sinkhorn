@@ -35,7 +35,7 @@ pip install -e ".[dev]"  # with dev dependencies
 
 ```python
 import torch
-from ot_triton import SamplesLoss
+from flash_sinkhorn import SamplesLoss
 
 x = torch.randn(4096, 64, device="cuda")
 y = torch.randn(4096, 64, device="cuda")
@@ -164,7 +164,7 @@ loss = SamplesLoss(loss="sinkhorn", blur=0.1, debias=True, use_flashstyle=False)
 Low-level FlashSinkhorn API:
 
 ```python
-from ot_triton.kernels import (
+from flash_sinkhorn.kernels import (
     sinkhorn_flashstyle_symmetric,     # Full symmetric solver
     sinkhorn_flashstyle_alternating,   # Full alternating solver
     flashsinkhorn_symmetric_step,      # Single fused iteration
@@ -199,7 +199,7 @@ SamplesLoss(
 
 ```python
 # FlashSinkhorn (recommended)
-from ot_triton.kernels import (
+from flash_sinkhorn.kernels import (
     sinkhorn_flashstyle_symmetric,
     sinkhorn_flashstyle_alternating,
     apply_plan_vec_flashstyle,
@@ -207,13 +207,13 @@ from ot_triton.kernels import (
 )
 
 # Legacy kernels (still available)
-from ot_triton.kernels.sinkhorn_triton_geomloss_sqeuclid import (
+from flash_sinkhorn.kernels.sinkhorn_triton_geomloss_sqeuclid import (
     sinkhorn_geomloss_online_potentials_sqeuclid,
 )
-from ot_triton.kernels.sinkhorn_triton_grad_sqeuclid import (
+from flash_sinkhorn.kernels.sinkhorn_triton_grad_sqeuclid import (
     sinkhorn_geomloss_online_grad_sqeuclid,
 )
-from ot_triton.hvp import hvp_x_sqeuclid_from_potentials
+from flash_sinkhorn.hvp import hvp_x_sqeuclid_from_potentials
 ```
 
 ## Key Concepts
@@ -250,16 +250,16 @@ pip install geomloss pykeops ott-jax jax[cuda12]
 **Run benchmarks:**
 ```bash
 # Forward pass benchmark
-python -m ot_triton.bench.bench_forward --sizes 5000,10000,20000 --dims 64 --verify
+python -m flash_sinkhorn.bench.bench_forward --sizes 5000,10000,20000 --dims 64 --verify
 
 # Backward pass benchmark
-python -m ot_triton.bench.bench_backward --sizes 5000,10000,20000 --dims 64 --verify
+python -m flash_sinkhorn.bench.bench_backward --sizes 5000,10000,20000 --dims 64 --verify
 
 # Quick test (small size)
-python -m ot_triton.bench.bench_forward --sizes 5000 --dims 4 --verify
+python -m flash_sinkhorn.bench.bench_forward --sizes 5000 --dims 4 --verify
 
 # Run only FlashSinkhorn (skip GeomLoss/OTT-JAX)
-python -m ot_triton.bench.bench_forward --sizes 10000 --dims 64 --no-geomloss --no-ott
+python -m flash_sinkhorn.bench.bench_forward --sizes 10000 --dims 64 --no-geomloss --no-ott
 ```
 
 Results are saved to `output/paper_benchmarks/forward/` and `output/paper_benchmarks/backward/`.

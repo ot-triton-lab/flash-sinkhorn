@@ -1,11 +1,11 @@
-# OT Triton API Reference
+# FlashSinkhorn API Reference
 
 This document describes the `SamplesLoss` API, which provides a GeomLoss-compatible interface for computing entropic optimal transport using Triton kernels.
 
 ## SamplesLoss
 
 ```python
-from ot_triton import SamplesLoss
+from flash_sinkhorn import SamplesLoss
 ```
 
 The main entry point for computing Sinkhorn distances and potentials. Drop-in compatible with GeomLoss's `SamplesLoss` for common use cases.
@@ -14,7 +14,7 @@ The main entry point for computing Sinkhorn distances and potentials. Drop-in co
 
 ```python
 import torch
-from ot_triton import SamplesLoss
+from flash_sinkhorn import SamplesLoss
 
 # Create loss function
 loss = SamplesLoss("sinkhorn", blur=0.1, scaling=0.5, debias=False)
@@ -154,7 +154,7 @@ Control marginal relaxation via `reach`, `reach_x`, and `reach_y` parameters. Th
 ### Balanced OT (Default)
 
 ```python
-from ot_triton import SamplesLoss
+from flash_sinkhorn import SamplesLoss
 import torch
 
 loss = SamplesLoss("sinkhorn", blur=0.1, scaling=0.5, debias=False)
@@ -361,7 +361,7 @@ For direct access to the Triton kernels:
 ### FlashSinkhorn (Shifted Potentials) — Recommended
 
 ```python
-from ot_triton.kernels import (
+from flash_sinkhorn.kernels import (
     sinkhorn_flashstyle_symmetric,
     sinkhorn_flashstyle_alternating,
 )
@@ -385,7 +385,7 @@ f, g = sinkhorn_flashstyle_alternating(
 #### Shifted Potential Transport Plan Application
 
 ```python
-from ot_triton.kernels import apply_plan_vec_flashstyle, apply_plan_mat_flashstyle
+from flash_sinkhorn.kernels import apply_plan_vec_flashstyle, apply_plan_mat_flashstyle
 
 # Apply transport plan to a vector: result_i = sum_j P(i,j) * v_j
 result = apply_plan_vec_flashstyle(
@@ -403,7 +403,7 @@ result = apply_plan_mat_flashstyle(
 #### Potential Conversion
 
 ```python
-from ot_triton.kernels import (
+from flash_sinkhorn.kernels import (
     standard_to_shifted_potentials,
     shifted_to_standard_potentials,
 )
@@ -418,7 +418,7 @@ f, g = shifted_to_standard_potentials(f_shift, g_shift, x, y, cost_scale=0.5)
 ### GeomLoss-Style (Symmetric Updates) — Legacy
 
 ```python
-from ot_triton.kernels import sinkhorn_geomloss_symmetric_potentials_sqeuclid
+from flash_sinkhorn.kernels import sinkhorn_geomloss_symmetric_potentials_sqeuclid
 
 f, g = sinkhorn_geomloss_symmetric_potentials_sqeuclid(
     x, y, a, b,
@@ -443,7 +443,7 @@ f, g = sinkhorn_geomloss_symmetric_potentials_sqeuclid(
 ### OTT-Style (Alternating Updates)
 
 ```python
-from ot_triton.kernels.sinkhorn_triton_ott_sqeuclid import sinkhorn_potentials_sqeuclid
+from flash_sinkhorn.kernels.sinkhorn_triton_ott_sqeuclid import sinkhorn_potentials_sqeuclid
 
 # OTT-style uses log-weights (loga, logb) instead of weights (a, b)
 import torch
@@ -463,7 +463,7 @@ f, g = sinkhorn_potentials_sqeuclid(
 
 ## Comparison with GeomLoss
 
-| Feature | OT Triton | GeomLoss |
+| Feature | FlashSinkhorn | GeomLoss |
 |---------|-----------|----------|
 | Cost function | Squared Euclidean only | Multiple (Euclidean, Laplacian, etc.) |
 | Backend | Triton (symmetric, O(nd) memory) | PyTorch (tensorized, symmetric, multiscale) |
@@ -482,8 +482,8 @@ f, g = sinkhorn_potentials_sqeuclid(
 from geomloss import SamplesLoss as GeomLossSamplesLoss
 loss_geo = GeomLossSamplesLoss("sinkhorn", blur=0.1, scaling=0.5, debias=False)
 
-# OT Triton (drop-in replacement for balanced OT)
-from ot_triton import SamplesLoss
+# FlashSinkhorn (drop-in replacement for balanced OT)
+from flash_sinkhorn import SamplesLoss
 loss_tri = SamplesLoss("sinkhorn", blur=0.1, scaling=0.5, debias=False)
 
 # Both work the same way
@@ -497,12 +497,12 @@ cost_tri = loss_tri(x, y)
 
 ### Cost and Epsilon Convention
 
-OT Triton uses **full squared Euclidean cost**: `C(x,y) = ||x - y||²`
+FlashSinkhorn uses **full squared Euclidean cost**: `C(x,y) = ||x - y||²`
 
 The epsilon schedule uses `eps = blur^p` (same as GeomLoss), providing exact potential parity when using matching cost functions:
 
 ```python
-# For potential parity with OT Triton, use full squared cost
+# For potential parity with FlashSinkhorn, use full squared cost
 def full_sqdist_cost(x, y):
     return ((x[:, :, None, :] - y[:, None, :, :]) ** 2).sum(dim=-1)
 
@@ -534,10 +534,10 @@ The shifted formulation factors out the quadratic norm from the LSE, reducing pe
 
 Convert between conventions:
 ```python
-from ot_triton.hvp import geomloss_to_ott_potentials
+from flash_sinkhorn.hvp import geomloss_to_ott_potentials
 f_hat, g_hat = geomloss_to_ott_potentials(f, g, a, b, eps=0.1)
 
-from ot_triton.kernels import standard_to_shifted_potentials, shifted_to_standard_potentials
+from flash_sinkhorn.kernels import standard_to_shifted_potentials, shifted_to_standard_potentials
 f_shift, g_shift = standard_to_shifted_potentials(f, g, x, y, cost_scale=0.5)
 f, g = shifted_to_standard_potentials(f_shift, g_shift, x, y, cost_scale=0.5)
 ```
