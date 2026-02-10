@@ -4,6 +4,10 @@
 
 # FlashSinkhorn
 
+[![PyPI](https://img.shields.io/pypi/v/flash-sinkhorn)](https://pypi.org/project/flash-sinkhorn/)
+[![Python](https://img.shields.io/pypi/pyversions/flash-sinkhorn)](https://pypi.org/project/flash-sinkhorn/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **Streaming Entropic Optimal Transport in PyTorch + Triton**
 
 FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**never materializing the n×m cost matrix**—enabling **O(nd) memory** instead of O(n²).
@@ -23,8 +27,10 @@ FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**neve
 ## Install
 
 ```bash
-pip install -e .
-pip install -e ".[dev]"  # with dev dependencies
+pip install flash-sinkhorn
+
+# From source (development)
+pip install -e ".[dev]"
 ```
 
 **Requirements:** PyTorch ≥2.5, Triton ≥3.1, CUDA 12.x
