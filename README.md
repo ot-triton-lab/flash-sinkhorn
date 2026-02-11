@@ -14,7 +14,7 @@ FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**neve
 
 ## Features
 
-- **FlashSinkhorn kernels** — shifted-potential formulation inspired by FlashAttention, 10-40% faster than previous Triton kernels at n >= 10k
+- **FlashSinkhorn kernels** — shifted-potential formulation inspired by FlashAttention. On A100 GPUs, achieves up to **32× forward-pass** and **161× end-to-end** speedups over state-of-the-art online baselines on point-cloud OT
 - **Fused Triton kernels** for forward, gradient, and HVP
 - **GeomLoss-compatible API** (`SamplesLoss`)
 - **Analytic gradients** (no backprop through Sinkhorn iterations)
@@ -46,7 +46,6 @@ from flash_sinkhorn import SamplesLoss
 x = torch.randn(4096, 64, device="cuda")
 y = torch.randn(4096, 64, device="cuda")
 
-# FlashSinkhorn is the default backend (use_flashstyle=True)
 loss = SamplesLoss(loss="sinkhorn", blur=0.1, debias=True)
 cost = loss(x, y)
 ```
@@ -131,7 +130,7 @@ hvp = torch.autograd.grad((grad_x * v).sum(), x)[0]
 
 ## FlashSinkhorn (v0.3.0)
 
-FlashSinkhorn is a reformulated Sinkhorn kernel that uses **shifted potentials** inspired by FlashAttention. It reduces bias vector loads by 67% and elementwise operations by 78% per tile, yielding 10-40% speedups for n >= 10,000.
+FlashSinkhorn is a reformulated Sinkhorn kernel that uses **shifted potentials** inspired by FlashAttention. It reduces bias vector loads by 67% and elementwise operations by 78% per tile, and improves scalability on OT-based downstream tasks.
 
 ### How It Works
 
@@ -155,17 +154,7 @@ Standard Sinkhorn loads 3 bias vectors per tile (g, log_b, y²). FlashSinkhorn p
 | 20,000 | 25.7 ms | 21.7 ms | **1.19x** |
 | 10,000 | 8.9 ms | 8.3 ms | **1.07x** |
 
-### Usage
-
-FlashSinkhorn is enabled by default (`use_flashstyle=True`):
-
-```python
-# Default: uses FlashSinkhorn (fastest for n >= 5000)
-loss = SamplesLoss(loss="sinkhorn", blur=0.1, debias=True)
-
-# Explicitly disable to use previous kernels
-loss = SamplesLoss(loss="sinkhorn", blur=0.1, debias=True, use_flashstyle=False)
-```
+### Low-Level API
 
 Low-level FlashSinkhorn API:
 
@@ -197,7 +186,6 @@ SamplesLoss(
     n_iters=None,             # Max iterations (None = use scaling)
     threshold=None,           # Early stopping threshold
     inner_iterations=10,      # Check convergence every N iters
-    use_flashstyle=True,      # Use FlashSinkhorn shifted-potential kernels
 )
 ```
 

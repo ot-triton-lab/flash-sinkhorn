@@ -71,7 +71,6 @@ Control marginal relaxation via `reach`, `reach_x`, and `reach_y` parameters. Th
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `backend` | `str` | `"symmetric"` | Backend: `"symmetric"` (GeomLoss-style) or `"alternating"` (OTT-JAX-style). |
-| `use_flashstyle` | `bool` | `True` | Use FlashSinkhorn shifted-potential kernels (10-40% faster at n >= 10k). |
 | `autotune` | `bool` | `True` | Enable Triton autotuning for kernel configs. |
 
 **Backend comparison:**
