@@ -20,6 +20,7 @@ from flash_sinkhorn.implicit_grad import (
     implicit_grad_x,
     implicit_grad_x_from_potentials,
 )
+from flash_sinkhorn.c_transform import c_transform_fwd, c_transform_cost
 
 __all__ = [
     "SamplesLoss",
@@ -33,6 +34,8 @@ __all__ = [
     "ImplicitGradInfo",
     "implicit_grad_x",
     "implicit_grad_x_from_potentials",
+    "c_transform_fwd",
+    "c_transform_cost",
     "__version__",
 ]
 __version__ = "0.3.2"

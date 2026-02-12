@@ -35,6 +35,9 @@ from flash_sinkhorn.kernels.sinkhorn_triton_grad_sqeuclid import (
     sinkhorn_geomloss_online_grad_sqeuclid,
 )
 
+# C-Transform (hard argmin) kernel
+from flash_sinkhorn.kernels.c_transform_sqeuclid import c_transform_kernel
+
 __all__ = [
     # Common
     "epsilon_schedule",
@@ -47,6 +50,8 @@ __all__ = [
     "apply_plan_mat_flashstyle",
     # Gradient
     "sinkhorn_geomloss_online_grad_sqeuclid",
+    # C-Transform
+    "c_transform_kernel",
 ]
 
 # ---------------------------------------------------------------------------
