@@ -1,0 +1,17 @@
+# Build configuration for publishing FlashSinkhorn on the Hugging Face Kernels
+# Hub (https://huggingface.co/docs/kernels/index) via `kernel-builder`.
+#
+# FlashSinkhorn is a pure Triton/PyTorch kernel (no compiled C++/CUDA
+# extension), so it is packaged as a "noarch" Triton build: a single build
+# variant works across CUDA toolkit versions and Torch C++ ABIs.
+#
+# See: https://github.com/huggingface/kernel-builder
+
+[general]
+name = "flash_sinkhorn"
+backends = ["triton"]
+version = 1
+license = "MIT"
+
+[general.hub]
+repo-id = "ot-triton-lab/flash-sinkhorn"
