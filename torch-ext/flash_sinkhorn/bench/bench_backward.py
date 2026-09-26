@@ -266,8 +266,8 @@ def bench_geomloss_backward(
     except ImportError:
         return BackwardResult(f"geomloss_{backend}", n, m, d, eps, 0, 0, 0, 0, oom=True)
 
-    from geomloss.sinkhorn_divergence import log_weights, sinkhorn_cost, sinkhorn_loop
-    from geomloss.sinkhorn_samples import lse_genred, softmin_online
+    from geomloss._legacy.sinkhorn_divergence import log_weights, sinkhorn_cost, sinkhorn_loop
+    from geomloss._legacy.sinkhorn_samples import lse_genred, softmin_online
 
     torch.manual_seed(0)
     x = torch.randn(n, d, device=device, dtype=torch.float32).requires_grad_(True)
@@ -364,8 +364,8 @@ def bench_geomloss_tensorized_backward(
     Note: Tensorized can be faster than online methods at small n due to
     precomputed cost matrix, but OOMs at large n due to O(n²) memory.
     """
-    from geomloss.sinkhorn_divergence import log_weights, sinkhorn_cost, sinkhorn_loop
-    from geomloss.sinkhorn_samples import softmin_tensorized
+    from geomloss._legacy.sinkhorn_divergence import log_weights, sinkhorn_cost, sinkhorn_loop
+    from geomloss._legacy.sinkhorn_samples import softmin_tensorized
 
     torch.manual_seed(0)
     x = torch.randn(n, d, device=device, dtype=torch.float32).requires_grad_(True)
@@ -853,8 +853,8 @@ def verify_gradient_parity(
     # GeomLoss gradient
     x2 = x.detach().clone().requires_grad_(True)
     try:
-        from geomloss.sinkhorn_divergence import log_weights, sinkhorn_cost, sinkhorn_loop
-        from geomloss.sinkhorn_samples import lse_genred, softmin_online
+        from geomloss._legacy.sinkhorn_divergence import log_weights, sinkhorn_cost, sinkhorn_loop
+        from geomloss._legacy.sinkhorn_samples import lse_genred, softmin_online
 
         eps_list = [eps] * n_iters
         a_log = log_weights(a)

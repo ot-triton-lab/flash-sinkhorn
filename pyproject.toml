@@ -36,7 +36,7 @@ Repository = "https://github.com/ot-triton-lab/flash-sinkhorn"
 [project.optional-dependencies]
 dev = [
   "pytest",
-  "geomloss",
+  "geomloss>=0.3",
   "pykeops",
   "jax",
   "ott-jax",

@@ -319,8 +319,8 @@ def bench_geomloss_online(
     except ImportError:
         return TimingResult("geomloss_online", n, m, d, eps, float("inf"), 0, 0, 0, 0, 0, oom=True)
 
-    from geomloss.sinkhorn_divergence import log_weights, sinkhorn_loop
-    from geomloss.sinkhorn_samples import lse_genred, softmin_online
+    from geomloss._legacy.sinkhorn_divergence import log_weights, sinkhorn_loop
+    from geomloss._legacy.sinkhorn_samples import lse_genred, softmin_online
 
     torch.manual_seed(0)
     x = torch.randn(n, d, device=device, dtype=torch.float32)
@@ -384,8 +384,8 @@ def bench_geomloss_tensorized(
     Materializes O(n²) cost matrix in GPU memory.
     Cost convention: ||x-y||² (full squared Euclidean, matches FlashSinkhorn).
     """
-    from geomloss.sinkhorn_divergence import log_weights, sinkhorn_loop
-    from geomloss.sinkhorn_samples import softmin_tensorized
+    from geomloss._legacy.sinkhorn_divergence import log_weights, sinkhorn_loop
+    from geomloss._legacy.sinkhorn_samples import softmin_tensorized
 
     torch.manual_seed(0)
     x = torch.randn(n, d, device=device, dtype=torch.float32)
@@ -774,8 +774,8 @@ def measure_jit_overhead(
             # Force KeOps to recompile by using a fresh import context
             # Note: KeOps caches compiled kernels on disk, so true cold start
             # requires clearing ~/.cache/keops* (not done here for safety)
-            from geomloss.sinkhorn_divergence import log_weights, sinkhorn_loop
-            from geomloss.sinkhorn_samples import lse_genred, softmin_online
+            from geomloss._legacy.sinkhorn_divergence import log_weights, sinkhorn_loop
+            from geomloss._legacy.sinkhorn_samples import lse_genred, softmin_online
 
             eps_list = [eps] * n_iters
             a_log = log_weights(a)
@@ -1258,8 +1258,8 @@ def verify_loss_parity(
 
     # GeomLoss loss
     try:
-        from geomloss.sinkhorn_divergence import log_weights, sinkhorn_cost, sinkhorn_loop
-        from geomloss.sinkhorn_samples import lse_genred, softmin_online
+        from geomloss._legacy.sinkhorn_divergence import log_weights, sinkhorn_cost, sinkhorn_loop
+        from geomloss._legacy.sinkhorn_samples import lse_genred, softmin_online
 
         eps_list = [eps] * n_iters
         a_log = log_weights(a)
