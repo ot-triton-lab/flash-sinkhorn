@@ -70,7 +70,8 @@ Control marginal relaxation via `reach`, `reach_x`, and `reach_y` parameters. Th
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `backend` | `str` | `"symmetric"` | Backend: `"symmetric"` (GeomLoss-style) or `"alternating"` (OTT-JAX-style). |
+| `backend` | `str` | `"symmetric"` | Backend: `"symmetric"` (GeomLoss-style), `"alternating"` (OTT-JAX-style) or `"multiscale"` (large 3-D point clouds, see below). |
+| `tol` | `float` or `None` | `None` | Target marginal residual `max(‖P1−a‖₁, ‖Pᵀ1−b‖₁)` for `backend="multiscale"` (default `5e-3`); rejected by the other backends. |
 | `autotune` | `bool` | `True` | Enable Triton autotuning for kernel configs. |
 
 **Backend comparison:**
@@ -319,6 +320,49 @@ cost = loss(x, y)  # Matches OTT-JAX's sinkhorn() output
 - Unbalanced/semi-unbalanced OT
 - Epsilon-scaling schedules
 
+### Multiscale Backend (Large 3-D Point Clouds)
+
+```python
+loss = SamplesLoss("sinkhorn", blur=0.03, backend="multiscale", tol=5e-3)
+cost = loss(a, x, b, y)                 # x: (n, 3), y: (m, 3), CUDA
+info = loss.last_multiscale_info        # accepted, stop, B, t, fine_updates, ...
+```
+
+The multiscale backend sorts both clouds along a Morton curve, anneals Sinkhorn on
+cell centroids, lifts the potentials to the points and finishes with block-sparse
+symmetric updates (dense ones when the blur spans most of the cloud). The mask is
+rebuilt at every update; in exact arithmetic, omitting a tile removes at most `δ a_i`
+from each of its rows and `δ b_j` from each of its columns, with `δ = tol / (4 max(N_B, M_B))`,
+so no row or column loses more than `tol / 4` of its mass. The solve returns once a sampled
+check (1024 rows and columns, 8192 when inconclusive, mean plus three standard errors; an
+empirical stopping rule, not a bound) finds `max(‖P1−a‖₁, ‖Pᵀ1−b‖₁) ≤ tol`; otherwise it
+warns and returns its best candidate with `accepted=False`.
+
+- It solves the **centered, TF32-rounded** clouds at `eps = blur**2`, with its own
+  annealing schedule. `allow_tf32=False`, `use_epsilon_scaling=False`, `eps`, `eps_list`,
+  `n_iters`, `diameter`, `threshold`, `pad_to_multiple`, `reach*` and label costs are
+  rejected; `scaling`, `last_extrapolation`, `inner_iterations`, `use_exp2`, the kernel
+  launch options and the `hvp_*` options do not apply.
+- Balanced OT only; `debias` and `half_cost` are supported, and each of the three debiased
+  problems is checked against `tol` separately (the warning names any that is not confirmed).
+- Forward only: `potentials=True` returns potentials without autograd (those of OT(a, b),
+  not debiased, as with the symmetric backend), and the cost path raises for inputs
+  that require gradients.
+- The coarse cells are kept at most 9 blurs wide where the cell-count limits allow it, even
+  beyond the L2 budget: wider cells can lift potentials that leave rows so short of mass that
+  the fine masks prune them whole. Clouds smaller than about 8192 points per side are annealed on
+  the points themselves.
+- The fine stage stops once its sampled score has improved by less than 1% over three
+  consecutive windows of 64 updates, or after 2048 updates. It stops as unstable when a mask
+  admits no tile for more than 1% of the block rows of positive mass on either side (before
+  repairing them), and when two checks in a row give no finite score. The solve then warns and
+  sets `accepted=False` (`info.stop` is `"stalled"`, `"unstable"` or `"ceiling"`).
+- `flash_sinkhorn.multiscale.solve_multiscale(x, y, a, b, eps, tol)` is the solver itself.
+  It returns `(f, g, info)` for the full cost `||x − y||²` and expects clouds already passed
+  through `flash_sinkhorn.multiscale.preprocess_coordinates`; unrounded coordinates are rejected,
+  and the weights must sum to one within `min(1e-3, tol / 4)` (so must `SamplesLoss` weights
+  with `normalize=False`).
+
 ### Custom Epsilon Schedule
 
 ```python
@@ -558,15 +602,15 @@ grad_x, grad_psi = torch.autograd.grad(loss, [x, psi])
 | Feature | FlashSinkhorn | GeomLoss |
 |---------|-----------|----------|
 | Cost function | Squared Euclidean only | Multiple (Euclidean, Laplacian, etc.) |
-| Backend | Triton (symmetric, O(nd) memory) | PyTorch (tensorized, symmetric, multiscale) |
+| Backend | Triton (symmetric, alternating, multiscale) | PyTorch (tensorized, symmetric, multiscale) |
 | Unbalanced OT | Yes (`reach`, `reach_x`, `reach_y`) | Yes (`reach`) |
 | Semi-unbalanced OT | Yes (`reach_x` ≠ `reach_y`) | No |
 | Debiased Sinkhorn | Yes (`debias=True`) | Yes |
 | Early stopping | Yes (`threshold`, 2-4x speedup) | No (epsilon-scaling only) |
 | Adaptive padding | Yes (`pad_to_multiple`, variable-size OT) | No |
-| Gradient | Analytic (no backprop) | Analytic (no backprop) |
-| HVP | Yes (CG solver) | No |
-| Memory | O(nd) streaming | O(n + m) symmetric or O(nm) tensorized |
+| Gradient | Analytic (no backprop; not for multiscale) | Analytic (no backprop) |
+| HVP | Yes (CG solver; not for multiscale) | No |
+| Memory | O(nd) streaming (multiscale also stores its block masks) | O(n + m) symmetric or O(nm) tensorized |
 
 ### Migration from GeomLoss
 
