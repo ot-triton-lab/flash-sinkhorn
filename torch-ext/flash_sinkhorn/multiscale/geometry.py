@@ -209,6 +209,26 @@ def cell_edge(sides: Tuple[float, float, float], t: int) -> float:
     return max(side * (1 << math.ceil(max(t - axis, 0) / 3)) / MAX_QUANTIZED for axis, side in enumerate(sides))
 
 
+def _feasible_levels(counts_x: Dict[int, int], counts_y: Dict[int, int], n: int, m: int, B: int):
+    limit_x = max(CELLS_PER_BLOCK * math.ceil(n / B), CELL_FLOOR)
+    limit_y = max(CELLS_PER_BLOCK * math.ceil(m / B), CELL_FLOOR)
+    feasible = [t for t in range(KEY_BITS) if _index_supported(counts_x[t], counts_y[t], n, m, B)
+                and counts_x[t] <= limit_x and counts_y[t] <= limit_y]
+    if not feasible:
+        raise RuntimeError("no cell level satisfies the indexing and cell-count limits")
+    return feasible
+
+
+def narrowest_cell_edge(counts_x: Dict[int, int], counts_y: Dict[int, int], n: int, m: int, B: int,
+                        l2_bytes: int, sides: Tuple[float, float, float]) -> float:
+    """Longest cell edge of the finest level within CELL_L2_MULTIPLE times the L2 budget: the narrowest cells
+    the coarse stage can use on this GPU."""
+    cap = CELL_L2_MULTIPLE * L2_FRACTION * l2_bytes
+    levels = [t for t in _feasible_levels(counts_x, counts_y, n, m, B)
+              if COARSE_BYTES_PER_CELL * (counts_x[t] + counts_y[t]) <= cap]
+    return cell_edge(sides, levels[0]) if levels else math.inf
+
+
 def choose_cell_level(counts_x: Dict[int, int], counts_y: Dict[int, int], n: int, m: int, B: int,
                       l2_bytes: int, sides: Tuple[float, float, float], eps: float) -> int:
     """Finest t whose cells fit the L2 budget, unless its cells are more than CELL_EDGE_BLURS blurs wide:
@@ -217,12 +237,7 @@ def choose_cell_level(counts_x: Dict[int, int], counts_y: Dict[int, int], n: int
     count). A cloud with no level within the L2 budget is refused. Every choice respects the int32 indexing
     and the per-side cell limit ``max(CELLS_PER_BLOCK * ceil(n / B), CELL_FLOOR)``; small clouds are annealed
     on the points themselves."""
-    limit_x = max(CELLS_PER_BLOCK * math.ceil(n / B), CELL_FLOOR)
-    limit_y = max(CELLS_PER_BLOCK * math.ceil(m / B), CELL_FLOOR)
-    feasible = [t for t in range(KEY_BITS) if _index_supported(counts_x[t], counts_y[t], n, m, B)
-                and counts_x[t] <= limit_x and counts_y[t] <= limit_y]
-    if not feasible:
-        raise RuntimeError("no cell level satisfies the indexing and cell-count limits")
+    feasible = _feasible_levels(counts_x, counts_y, n, m, B)
     widest = CELL_EDGE_BLURS * math.sqrt(eps)
     size = lambda t: COARSE_BYTES_PER_CELL * (counts_x[t] + counts_y[t])
     within_l2 = [t for t in feasible if size(t) <= L2_FRACTION * l2_bytes]

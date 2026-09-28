@@ -1,5 +1,6 @@
 """End-to-end tests of backend="multiscale" and tables of its automatic rules."""
 
+import math
 import warnings
 
 import pytest
@@ -291,8 +292,9 @@ def test_not_confirmed_returns_best_candidate():
     f, g, info = solve_multiscale(xp, yp, a, a, 1e-2, 1e-9)
     assert not info.accepted and info.stop in ("stalled", "ceiling")
     assert info.fine_updates >= solver.FINE_WINDOW * (1 + solver.FINE_SLOW_WINDOWS)
-    ranked = [c for c in info.checks if c["rank"] is not None]
+    ranked = [c for c in info.checks if c["rank"] is not None and c["kind"] != "fp64"]
     best = min(ranked, key=lambda c: c["rank"])
+    assert info.checks[-1]["kind"] == "fp64" and not info.checks[-1]["accepted"]  # re-checked in fp64, refused
     assert (info.returned, info.returned_step) == (best["kind"], best["step"])
     assert torch.isfinite(f).all() and torch.isfinite(g).all()
 
@@ -336,14 +338,14 @@ def test_mask_too_large_stops_the_fine_stage(monkeypatch):
     f, g, info = solve_multiscale(xp, yp, a, a, 1e-3, TOL)
     assert not info.accepted and info.stop == "too large" and info.fine_updates == 0 and "CSR" in info.detail
     assert torch.isfinite(f).all() and torch.isfinite(g).all()
-    with pytest.warns(RuntimeWarning, match=r"OT\(a, b\) stopped as too large.*int32 indices"):
+    with pytest.warns(RuntimeWarning, match=r"OT\(a, b\) stopped as too large.*CSR can hold"):
         SamplesLoss("sinkhorn", blur=1e-3 ** 0.5, backend="multiscale")(x, y)
 
 
 @cuda
 def test_work_budget_stops_the_fine_stage(monkeypatch):
-    """Fine updates and previews check their estimated point pairs before launch; the next update past
-    WORK_PER_POINT pairs per point stops the stage as "budget" with the best candidate, within the budget."""
+    """Fine updates and previews count their point pairs before launch; the next update past WORK_PER_POINT
+    pairs per point stops the stage as "budget" with the best candidate, within the budget."""
     n = 2**14
     x, y, a = clustered(n, 34), clustered(n, 35), uniform_weights(n)
     xp, yp = preprocess_coordinates(x, y, a, a)
@@ -403,9 +405,21 @@ def test_admitted_mask_backs_off_after_out_of_memory(monkeypatch):
         return refine(x, *args, **kwargs)
 
     monkeypatch.setattr(fine, "refine_mask_exact", small_only)
-    backed = fine.admitted_mask(geo, state, eps, delta_rel)
+    meter = fine.WorkMeter()
+    backed = fine.admitted_mask(geo, state, eps, delta_rel, meter)
     assert rows[0] == geo["N_B"] and len(rows) > 5 and max(rows[1:]) < geo["N_B"]
+    assert meter.spent > one[0] * 64 * 64                                   # the refused attempts stay charged
+    with pytest.raises(fine.WorkBudget):                                    # and a charge past the limit launches nothing
+        fine.admitted_mask(geo, state, eps, delta_rel, fine.WorkMeter(one[0] * 64 * 64 * 1.5))
     assert one[0] == backed[0] and torch.equal(one[1], backed[1]) and torch.equal(one[2], backed[2])
+
+    monkeypatch.setattr(fine, "refine_mask_exact", refine)
+    monkeypatch.setattr(block_mask, "CSR_INDEX_MAX", int(one[2].numel()) - 1)  # admitted overflow after refining
+    meter = fine.WorkMeter()
+    with pytest.raises(fine.MaskTooLarge, match="admitted mask exceeds"):
+        fine.admitted_mask(geo, state, eps, delta_rel, meter)
+    assert meter.spent == one[0] * 64 * 64                                # the interrupted refinement stays charged
+    monkeypatch.undo()
 
     def never(*args, **kwargs):
         raise torch.cuda.OutOfMemoryError("refused")
@@ -413,6 +427,45 @@ def test_admitted_mask_backs_off_after_out_of_memory(monkeypatch):
     monkeypatch.setattr(fine, "refine_mask_exact", never)
     with pytest.raises(fine.MaskTooLarge, match="alone does not fit in device memory"):
         fine.admitted_mask(geo, state, eps, delta_rel)
+
+
+@cuda
+def test_limits_are_checked_before_the_solve(monkeypatch):
+    """check_limits reads the solver's own cell level and numbers from the geometry alone; outside a limit the
+    solver warns before solving, and an unconfirmed solve names the limit in its detail."""
+    from flash_sinkhorn.multiscale import envelope, check_limits
+    n = 2**14
+    x, y, a = clustered(n, 42), clustered(n, 43), uniform_weights(n)
+    xp, yp = preprocess_coordinates(x, y, a, a)
+    limits = check_limits(xp, yp, a, a, 1e-3)
+    assert limits.inside and 0 < limits.narrowest_blurs <= limits.cell_blurs <= geometry.CELL_EDGE_BLURS
+    assert 0 < limits.ulp_over_eps < envelope.PRECISION_LIMIT
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)                      # inside: no warning
+        f, g, info = solve_multiscale(xp, yp, a, a, 1e-3, 1e-9)
+    assert info.envelope == limits and "below the warning thresholds" in info.detail
+    tiny = check_limits(xp, yp, a, a, 1e-9)                                  # fp32 cannot resolve this blur
+    assert not tiny.inside and any("ulp" in r for r in tiny.reasons)
+    monkeypatch.setattr(geometry, "CELL_EDGE_BLURS", 1e-3)                  # no level narrow enough
+    monkeypatch.setattr(envelope, "CELL_EDGE_BLURS", 1e-3)
+    wide = check_limits(xp, yp, a, a, 1e-3)
+    assert not wide.inside and "blurs wide" in wide.reasons[0] and "times the current one" in wide.reasons[0]
+    with pytest.warns(RuntimeWarning, match="above its measured warning thresholds"):
+        f, g, info = solve_multiscale(xp, yp, a, a, 1e-3, 1e-9)
+    assert not info.accepted and "blurs wide" in info.detail and info.envelope == wide
+
+
+def test_envelope_norm_is_taken_in_fp64():
+    """The ulp is read from max |x|^2 summed in fp64: a TF32 point whose squared
+    norm rounds up to 1 in fp32 has an fp64 norm just below 1, so its ulp is 2^-24, not 2^-23."""
+    from flash_sinkhorn.multiscale import envelope
+    p = torch.tensor([[0.8916015625, 0.012908935546875, 0.45263671875]])
+    assert float((p * p).sum()) == 1.0 and float(p.double().square().sum()) < 1.0
+    cloud = type("Cloud", (), dict(points=torch.cat([p, -p]), n=2))()
+    joint = type("Joint", (), dict(source=cloud, target=cloud, sides=(1.0, 1.0, 1.0)))()
+    counts = {t: 1 for t in range(geometry.KEY_BITS)}
+    env = envelope.envelope(joint, counts, counts, 64, 62, 40 * 2**20, 1.0)
+    assert env.ulp_over_eps == 2.0 ** -24
 
 
 @cuda
@@ -467,6 +520,9 @@ def test_argument_validation(monkeypatch):
     xp, yp = preprocess_coordinates(x, y, a, a)
     with pytest.raises(ValueError, match="overflow fp32 potentials"):
         solve_multiscale(xp, yp, a, a, 1e-45, TOL)
+    for eps in (1e-45, 1e39):                                           # eps itself must be an fp32 number
+        with pytest.raises(ValueError, match="overflow fp32 potentials"):
+            multiscale.check_limits(xp, yp, a, a, eps)
     huge = xp.double()
     huge[0, 0] = 1e39                                  # finite in fp64 and TF32-rounded, infinite in fp32
     with pytest.raises(ValueError, match="x is not finite in fp32"):
@@ -513,6 +569,59 @@ def test_sampled_check_enlarges_when_inconclusive():
     for e in enlarged:
         assert e["final"] is not e["first"] and e["rank"] == e["first"]["score"]
         assert e["accepted"] == (e["final"]["score"] <= TOL)
+
+
+@cuda
+def test_fp64_check_agrees_where_rounding_is_small(monkeypatch):
+    """Where ulp(|x|^2) is far below tol * eps the fp64 re-check reads what the fp32 check reads, on the same samples."""
+    n, eps = 2**14, 1e-2
+    x, y, a = clustered(n, 16), clustered(n, 17), uniform_weights(n)
+    xp, yp, f, g, _ = solve(x, y, a, a, eps)
+    check = SampledCheck(xp, yp, a, a, eps, TOL)
+    e32, e64 = check.evaluate(f, g), check.evaluate_fp64(f, g)
+    for side in ("row", "col"):
+        assert abs(e32["first"][side][0] - e64["first"][side][0]) <= 1e-4
+    assert e32["accepted"] == e64["accepted"]
+    # A shift of the potentials by 0.1 eps moves every row sum by the factor e^0.1: the fp64 check must refuse it.
+    shifted = check.evaluate_fp64(f + 0.1 * eps, g)
+    assert not shifted["accepted"] and shifted["first"]["row"][0] == pytest.approx(math.expm1(0.1), rel=0.05)
+    # Leading zero-weight targets (two whole fp64 tiles of them) drop out instead of turning the rows into NaN.
+    from flash_sinkhorn.multiscale import check as check_module
+    monkeypatch.setattr(check_module, "FP64_COLS", 4096)
+    bz = torch.zeros(n, device="cuda")
+    bz[n // 2:] = 2.0 / n
+    dev = check_module._fp64_deviation(xp, f, torch.arange(8, device="cuda"), yp, g, bz, eps)
+    kept = check_module._fp64_deviation(xp, f, torch.arange(8, device="cuda"), yp[n // 2:], g[n // 2:], bz[n // 2:], eps)
+    assert torch.isfinite(dev).all() and torch.equal(dev, kept)             # zero-weight targets drop out exactly
+    empty = check_module._fp64_deviation(xp, f, torch.arange(8, device="cuda"), yp, g, torch.zeros(n, device="cuda"), eps)
+    assert torch.equal(empty, torch.ones_like(empty))                       # no target mass: r_i = 0, deviation 1
+
+
+@cuda
+def test_unconfirmed_stop_is_rechecked_in_fp64(monkeypatch):
+    """A fine stage whose fp32 check never accepts stops, and its best candidate is confirmed in fp64 on the same
+    samples; a target out of reach is re-checked and refused; a re-check that runs out of memory keeps the
+    unconfirmed return."""
+    n = 2**12
+    x, y, a = clustered(n, 44), clustered(n, 45), uniform_weights(n)
+    xp, yp = preprocess_coordinates(x, y, a, a)
+    real = SampledCheck.evaluate
+    monkeypatch.setattr(SampledCheck, "evaluate", lambda self, f, g: dict(real(self, f, g), accepted=False))
+    f, g, info = solve_multiscale(xp, yp, a, a, 1e-2, TOL)
+    assert (info.accepted, info.stop) == (True, "accepted") and "fp64" in info.detail
+    assert info.checks[-1]["kind"] == "fp64" and info.checks[-1]["accepted"]
+    assert max(residuals(xp, yp, a, a, f, g, 1e-2)) <= 1.1 * TOL
+    f, g, info = solve_multiscale(xp, yp, a, a, 1e-2, 1e-9)                   # out of reach: re-checked, refused
+    assert not info.accepted and info.checks[-1]["kind"] == "fp64" and not info.checks[-1]["accepted"]
+    stop, returned = info.stop, (info.returned, info.returned_step)
+
+    def refuse(self, f, g):
+        raise torch.cuda.OutOfMemoryError("refused")
+
+    monkeypatch.setattr(SampledCheck, "evaluate_fp64", refuse)
+    f, g, info = solve_multiscale(xp, yp, a, a, 1e-2, 1e-9)
+    assert (info.accepted, info.stop, (info.returned, info.returned_step)) == (False, stop, returned)
+    assert "fp64 re-check did not fit in device memory" in info.detail and info.checks[-1]["kind"] != "fp64"
 
 
 def test_stage_one_action():
@@ -697,7 +806,7 @@ def _mocked_fine_stage(monkeypatch, score, accept=lambda kind, h: False, termina
     the previews) is refused as unstable."""
     progress = dict(h=0, kind="lift")
 
-    def fake_fine_step(geo, state, eps, delta_rel, *, alpha=0.5, work_left=None):
+    def fake_fine_step(geo, state, eps, delta_rel, *, alpha=0.5, meter=None):
         if (unstable_from is not None and state.ordinary_steps >= unstable_from
                 and (alpha == 1.0 or not unstable_previews_only)):
             raise fine.UnstableMask("mocked")
@@ -716,6 +825,9 @@ def _mocked_fine_stage(monkeypatch, score, accept=lambda kind, h: False, termina
 
     monkeypatch.setattr(solver, "fine_step", fake_fine_step)
     monkeypatch.setattr(SampledCheck, "evaluate", fake_evaluate)
+    refused = dict(finite=False, row=None, col=None, score=None)            # the stop rules, not the fp64 re-check
+    monkeypatch.setattr(SampledCheck, "evaluate_fp64", lambda self, f, g: dict(
+        accepted=False, first=refused, final=refused, enlarged=False, rank=None, pair_finite=True))
     x, y, a = clustered(2**12, 12), clustered(2**12, 13), uniform_weights(2**12)
     xp, yp = preprocess_coordinates(x, y, a, a)
     _, _, info = solve_multiscale(xp, yp, a, a, 1e-2, TOL)

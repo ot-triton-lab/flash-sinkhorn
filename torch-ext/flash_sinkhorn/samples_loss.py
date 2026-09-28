@@ -604,18 +604,12 @@ class SamplesLoss(torch.nn.Module):
                 fy, gy, _ = solve(y, y, b, b, "OT(b, b)")
                 result = result - 0.5 * ((a * fx).sum() + (a * gx).sum()) - 0.5 * ((b * fy).sum() + (b * gy).sum())
         if not_accepted:
-            stops = "; ".join(f"{name} stopped as {info.stop} and returned {info.returned}@{info.returned_step}"
-                              for name, info in not_accepted)
-            hint = ""
-            if any(info.stop == "too large" for _, info in not_accepted):
-                hint += (' A "too large" stop means a mask or an update exceeded the int32 indices or the '
-                         "device memory; a larger tol or fewer points make the masks smaller.")
-            if any(info.stop == "budget" for _, info in not_accepted):
-                hint += (' A "budget" stop means the fine updates reached their work budget before a check '
-                         "confirmed tol.")
+            stops = "; ".join(f"{name} stopped as {info.stop} and returned {info.returned}@{info.returned_step} "
+                              f"({info.detail})" for name, info in not_accepted)
             warnings.warn(f'backend="multiscale": the sampled check did not confirm tol={self.tol:g} in '
-                          f"{len(not_accepted)} solve(s): {stops}. The best candidate was returned unconfirmed "
-                          f"(info.detail says why each stopped).{hint}", RuntimeWarning, stacklevel=3)
+                          f"{len(not_accepted)} solve(s): {stops}. The best candidate was returned unconfirmed; "
+                          "the API documentation's Limits say how to read these numbers.",
+                          RuntimeWarning, stacklevel=3)
         return result
 
     def forward(

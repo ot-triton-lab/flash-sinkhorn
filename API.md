@@ -325,7 +325,7 @@ cost = loss(x, y)  # Matches OTT-JAX's sinkhorn() output
 ```python
 loss = SamplesLoss("sinkhorn", blur=0.03, backend="multiscale", tol=5e-3)
 cost = loss(a, x, b, y)                 # x: (n, 3), y: (m, 3), CUDA
-info = loss.last_multiscale_info        # accepted, stop, detail, fine_work, B, t, fine_updates, ...
+info = loss.last_multiscale_info        # accepted, stop, detail, envelope, fine_work, B, t, fine_updates, ...
 ```
 
 The multiscale backend sorts both clouds along a Morton curve, anneals Sinkhorn on
@@ -354,19 +354,47 @@ warns and returns its best candidate with `accepted=False`.
   square of the cell count. When no level within twice the budget is narrow enough, the finest
   level within the L2 budget is kept. Clouds smaller than about 8192 points per side are annealed
   on the points themselves; a GPU whose L2 budget holds no cell level is refused.
-- The fine stage stops once its sampled score has improved by less than 1% over three consecutive windows
-  of 64 updates, or after 2048 updates. It stops as unstable when densely repairing a mask's empty block
-  rows of positive mass would cost more than one of the update's sparse half-steps, and when two checks
-  in a row give no finite score. It stops on its budget before any update whose estimated work would take
-  it past 4·10⁸ point pairs per point, (n + m)/2 points, previews included (`info.fine_work` is the
-  estimated work of the updates; retries are not counted). It stops as too large when a mask or an update
-  would exceed the int32 indices or the device memory; candidates that do not fit one CSR, or whose
-  refinement runs out of memory, are screened and refined in smaller chunks of block rows first. The
-  solve then warns and returns its best candidate with `accepted=False` (`info.stop` is `"stalled"`,
-  `"unstable"`, `"ceiling"`, `"budget"` or `"too large"`, and `info.detail` says why).
-- In sparse updates, empty block rows of zero mass keep their incoming potentials and are never
-  repaired; at the end every point of zero weight gets its c-transform against the returned
-  potentials of the other side.
+- The fine stage stops once its sampled score has improved by less than 1% over three consecutive windows of 64
+  updates, or after 2048 updates. It stops as unstable when densely repairing a mask's empty block rows of
+  positive mass would cost more than one of the update's sparse half-steps, and when two checks in a row give no
+  finite score. It stops on its budget before any refinement or update that would take its charged work past 4·10⁸
+  point pairs per point, (n + m)/2 points, previews and retries included (`info.fine_work` is the work charged;
+  screening and checks are not charged). It stops as too large when a mask or an update would exceed the int32
+  indices or the device memory; candidates that do not fit one CSR, or whose refinement runs out of memory, are
+  screened and refined in smaller chunks of block rows first. Before stopping as stalled, at the ceiling or on the
+  budget, the best candidate is checked once more on the same samples with the same rule, in fp64, and accepted if
+  it passes there (`info.detail` then says so, and `info.checks` ends with an entry of kind `"fp64"`); on an A100
+  at 2^26 points its first stage took about 15 s and the second, when drawn, costs about eight times more; it is
+  not part of `info.fine_work`. Otherwise the solve warns and returns its best candidate with `accepted=False`
+  (`info.stop` is `"stalled"`, `"unstable"`, `"ceiling"`, `"budget"` or `"too large"`, and `info.detail` says
+  why).
+- In sparse updates, empty block rows of zero mass keep their incoming potentials and are never repaired; at the
+  end every point of zero weight gets its c-transform against the returned potentials of the other side.
+- Limits, measured on A100-SXM4-80GB at tol 1e-2 (looser than the default 5e-3): tests of uniform, clustered (32
+  Gaussian clusters), surface and heterogeneous clouds, lognormal weights, LiDAR and N-body data, 2^22 to 2^27
+  points, at blurs of 0.35 to 100 median nearest-neighbour spacings.
+  `flash_sinkhorn.multiscale.check_limits(x, y, a, b, eps)` reads two warning thresholds from the geometry alone, on
+  clouds and weights prepared as for `solve_multiscale` (below), and took seconds in these tests; the solver warns
+  above either, then solves anyway.
+  - Coarse cells wider than 9 blurs (`envelope.cell_blurs`). Cells that are too wide lose the support of whole block
+    rows within the first fine updates, and the width at which that happens depends on the data: uniform clouds kept
+    it at 18 blurs, N-body data lost it at 17.8 at a blur where 8.9-blur cells converge (and at 12.8 with a smaller
+    blur). Within twice the L2 budget, a cloud filling a cube gets cells of at most 9 blurs up to a side of about
+    576 blurs (64 cells per axis), once it has enough points for the per-side cell limit to admit 64³ cells (about
+    2^24).
+  - ulp32(max |x|²)/eps above 0.05 (`envelope.ulp_over_eps`): no tested problem above it was accepted. Below it the
+    sampled check, computed in fp32, can still read high: at 0.019 it read a uniform 2^26 solution at 0.014 whose
+    fp64 residual was 0.007 on the same samples; the fp64 re-check above exists for that case.
+- Two limits show only while solving, and the solver reports them by its stop:
+  - Mask capacity. At 30 median spacings, transposing 1.1e9 to 1.4e9 admitted tiles ran out of memory on 80 GB
+    (heterogeneous from 2^24 points, clustered from 2^25, surface at 2^26), and larger masks exceed the int32
+    indices (2^31 tiles). In these tests the fine stage stopped as too large within minutes and returned its
+    best candidate.
+  - Convergence. The clustered clouds stalled at 2^22 points with 3 and 10 median spacings and stopped on the work
+    budget at 2^24 with 30 and at 2^26 with 10 (after 4.8 hours on this GPU); a LiDAR pair of 2.8e7 and 8.5e7
+    points stalled at 30.
+- An unconfirmed solve records its stop in `info.stop` and explains it in `info.detail`; `info.envelope` holds both
+  warning numbers.
 - `flash_sinkhorn.multiscale.solve_multiscale(x, y, a, b, eps, tol)` is the solver itself.
   It returns `(f, g, info)` for the full cost `||x − y||²` and expects clouds already passed
   through `flash_sinkhorn.multiscale.preprocess_coordinates`; unrounded coordinates are rejected,

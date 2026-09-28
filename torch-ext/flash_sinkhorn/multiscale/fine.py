@@ -42,7 +42,24 @@ class MaskTooLarge(RuntimeError):
 
 
 class WorkBudget(RuntimeError):
-    """The next fine update would exceed the fine stage's work budget (solver.WORK_PER_POINT)."""
+    """The next launch would take the fine stage past its work budget (solver.WORK_PER_POINT)."""
+
+
+class WorkMeter:
+    """Point pairs the fine stage launches, charged before each launch: a charge past ``limit`` raises WorkBudget
+    and launches nothing. Work of retried and interrupted attempts stays charged."""
+
+    def __init__(self, limit: float = math.inf):
+        self.limit, self.spent = limit, 0
+
+    def require(self, work: float, what: str) -> None:
+        if self.spent + work > self.limit:
+            raise WorkBudget(f"{what} would evaluate {work:.3g} point pairs, more than the "
+                             f"{self.limit - self.spent:.3g} left")
+
+    def charge(self, work: float, what: str) -> None:
+        self.require(work, what)
+        self.spent += work
 
 
 def _attempt(fn):
@@ -60,7 +77,6 @@ class FineState:
     g_hat: torch.Tensor
     ordinary_steps: int = 0
     kind: str = "ordinary"  # "terminal" for an unaveraged preview, which never continues
-    work: int = 0  # pair evaluations of the fine updates that led here (refinement, half-steps, repairs)
 
 
 def mask_delta_rel(geo: dict, tol: float) -> float:
@@ -87,13 +103,13 @@ def dense_by_geometry(geo: dict, eps: float) -> bool:
 
 @torch.no_grad()
 def fine_step(geo: dict, state: FineState, eps: float, delta_rel: float, *, alpha: float = 0.5,
-              work_left: float = None):
+              meter: WorkMeter = None):
     """One symmetric update; ``alpha`` 1/2 continues the solve, 1 gives a terminal preview.
 
     Returns the new state and ``(candidate tiles, admitted tiles)``, or ``None`` for a dense update.
-    Raises WorkBudget before any launch whose estimated work exceeds ``work_left`` point pairs (retries
-    are not counted), UnstableMask for non-finite potentials or an unaffordable repair, and MaskTooLarge
-    when the update does not fit the int32 indices or the device memory.
+    Charges each refinement, update and repair to ``meter`` before launching it, and raises WorkBudget
+    before one it cannot afford, UnstableMask for non-finite potentials or an unaffordable repair, and
+    MaskTooLarge when the update does not fit the int32 indices or the device memory.
     """
     if state.kind != "ordinary":
         raise ValueError("a terminal preview cannot be continued")
@@ -102,13 +118,9 @@ def fine_step(geo: dict, state: FineState, eps: float, delta_rel: float, *, alph
     if bool((~torch.isfinite(state.f_hat) & (geo["a_s"] > 0)).any() | (~torch.isfinite(state.g_hat) & (geo["b_s"] > 0)).any()):
         raise UnstableMask("the potentials are not finite on points of positive mass")
 
-    def affordable(work: float, what: str):
-        if work_left is not None and work > work_left:
-            raise WorkBudget(f"{what} would evaluate {work:.3g} point pairs, more than the {work_left:.3g} left")
-
+    meter = WorkMeter() if meter is None else meter
     if dense_by_geometry(geo, eps):
-        work = 2 * len(x) * len(y)
-        affordable(work, "a dense update")
+        meter.charge(2 * len(x) * len(y), "a dense update")
         result, err = _attempt(lambda: flashsinkhorn_symmetric_step(
             x, y, state.f_hat, state.g_hat, geo["log_a"], geo["log_b"], eps, cost_scale=1.0,
             alpha=alpha, damping_f=1.0, damping_g=1.0, allow_tf32=True, use_exp2=True, autotune=True))
@@ -117,7 +129,7 @@ def fine_step(geo: dict, state: FineState, eps: float, delta_rel: float, *, alph
         f, g = result
         tiles = None
     else:
-        candidates, crow, col = admitted_mask(geo, state, eps, delta_rel, work_left)
+        candidates, crow, col = admitted_mask(geo, state, eps, delta_rel, meter)
         half = int(col.numel()) * B * B
         result, err = _attempt(lambda: csr_transpose(crow, col, geo["N_B"], geo["M_B"]))
         if err:
@@ -129,8 +141,7 @@ def fine_step(geo: dict, state: FineState, eps: float, delta_rel: float, *, alph
             raise UnstableMask(f"the mask admits no block for {empty_x} source and {empty_y} target block rows of "
                                f"positive mass; repairing them densely ({repair:.3g} pair evaluations) would cost "
                                f"more than a sparse half-step ({half:.3g})")
-        work = candidates * B * B + 2 * half + repair
-        affordable(work, "the half-steps and repairs")
+        meter.charge(2 * half + repair, "the half-steps and repairs")
         result, err = _attempt(lambda: sparse_symmetric_step(
             x, y, state.f_hat, state.g_hat, geo["log_a"], geo["log_b"], eps, crow, col, crow_t, col_t,
             block=B, alpha=alpha))
@@ -139,19 +150,19 @@ def fine_step(geo: dict, state: FineState, eps: float, delta_rel: float, *, alph
         f, g = result
         tiles = (candidates, int(col.numel()))
     ordinary = alpha == 0.5
-    new = FineState(f, g, state.ordinary_steps + int(ordinary), "ordinary" if ordinary else "terminal",
-                    state.work + work)
+    new = FineState(f, g, state.ordinary_steps + int(ordinary), "ordinary" if ordinary else "terminal")
     return new, tiles
 
 
 @torch.no_grad()
-def admitted_mask(geo: dict, state: FineState, eps: float, delta_rel: float, work_left: float = None):
+def admitted_mask(geo: dict, state: FineState, eps: float, delta_rel: float, meter: WorkMeter = None):
     """``(candidates, crow, col)``: the box screen's candidates refined exactly into the admitted mask.
 
     When the candidates do not fit one CSR, or a refinement runs out of device memory, consecutive
     chunks of block rows (fewer after each failure) are screened and refined in turn and only their
     admitted tiles are kept; the admitted CSR is the same. Raises MaskTooLarge when a single block row
-    or the admitted mask does not fit, and WorkBudget before a refinement past ``work_left``.
+    or the admitted mask does not fit, and WorkBudget before a refinement ``meter`` cannot afford (every
+    attempt is charged, retries included).
     """
     B = geo["B"]
     x, y = geo["x_s"], geo["y_s"]
@@ -167,9 +178,8 @@ def admitted_mask(geo: dict, state: FineState, eps: float, delta_rel: float, wor
     counts = block_mask.screen_counts(screen)
     counts64 = counts.to(torch.int64)
     candidates = int(counts64.sum())
-    if work_left is not None and candidates * B * B > work_left:
-        raise WorkBudget(f"refining {candidates:,} candidate tiles would evaluate {candidates * B * B:.3g} point "
-                         f"pairs, more than the {work_left:.3g} left")
+    meter = WorkMeter() if meter is None else meter
+    meter.require(candidates * B * B, f"refining {candidates:,} candidate tiles")
 
     def refine(r0: int, r1: int):
         crow_c, col_c = block_mask.screen_fill(screen, counts, r0, r1)
@@ -186,6 +196,7 @@ def admitted_mask(geo: dict, state: FineState, eps: float, delta_rel: float, wor
         r1 = min(N_B, r0 + most, max(r0 + 1, int(torch.searchsorted(ends, base + room, right=True))))
         if int(ends[r1 - 1]) - base > room:
             raise MaskTooLarge(f"block row {r0} alone has more candidates than a CSR can hold ({room:,})")
+        meter.charge((int(ends[r1 - 1]) - base) * B * B, f"refining block rows {r0}-{r1 - 1}")
         result, err = _attempt(lambda: refine(r0, r1))
         if err:
             if r1 - r0 == 1:
