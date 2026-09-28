@@ -32,6 +32,8 @@ CELL_FLOOR = 8192    # ... but at least 8192, so that small clouds are annealed 
 INT32_OFFSET_LIMIT = 2**31  # offsets up to 16 * rows - 1 must fit a signed 32-bit integer
 CELL_EDGE_BLURS = 9.0  # the coarse cells may be at most 9 blurs wide, even beyond the L2 budget: wider
                        # cells can lift potentials that leave rows so short of mass that the fine masks empty them
+CELL_L2_MULTIPLE = 2   # ... but never more than twice the cells the L2 budget holds: the dense coarse updates
+                       # cost the square of the cell count
 
 # Geometric block-doubling test (64 -> 128).
 MERGE_INFLATION_Q90 = 1.5
@@ -210,9 +212,11 @@ def cell_edge(sides: Tuple[float, float, float], t: int) -> float:
 def choose_cell_level(counts_x: Dict[int, int], counts_y: Dict[int, int], n: int, m: int, B: int,
                       l2_bytes: int, sides: Tuple[float, float, float], eps: float) -> int:
     """Finest t whose cells fit the L2 budget, unless its cells are more than CELL_EDGE_BLURS blurs wide:
-    then the coarsest t whose cells are narrow enough, or the finest allowed if none is. Every choice
-    respects the int32 indexing and the per-side cell limit ``max(CELLS_PER_BLOCK * ceil(n / B),
-    CELL_FLOOR)``; small clouds are annealed on the points themselves."""
+    then the coarsest t whose cells are narrow enough, within CELL_L2_MULTIPLE times the L2 budget, and if
+    none is, the finest t within the L2 budget again (the dense coarse updates cost the square of the cell
+    count). A cloud with no level within the L2 budget is refused. Every choice respects the int32 indexing
+    and the per-side cell limit ``max(CELLS_PER_BLOCK * ceil(n / B), CELL_FLOOR)``; small clouds are annealed
+    on the points themselves."""
     limit_x = max(CELLS_PER_BLOCK * math.ceil(n / B), CELL_FLOOR)
     limit_y = max(CELLS_PER_BLOCK * math.ceil(m / B), CELL_FLOOR)
     feasible = [t for t in range(KEY_BITS) if _index_supported(counts_x[t], counts_y[t], n, m, B)
@@ -220,11 +224,16 @@ def choose_cell_level(counts_x: Dict[int, int], counts_y: Dict[int, int], n: int
     if not feasible:
         raise RuntimeError("no cell level satisfies the indexing and cell-count limits")
     widest = CELL_EDGE_BLURS * math.sqrt(eps)
-    within_l2 = [t for t in feasible if COARSE_BYTES_PER_CELL * (counts_x[t] + counts_y[t]) <= L2_FRACTION * l2_bytes]
-    if within_l2 and cell_edge(sides, within_l2[0]) <= widest:
+    size = lambda t: COARSE_BYTES_PER_CELL * (counts_x[t] + counts_y[t])
+    within_l2 = [t for t in feasible if size(t) <= L2_FRACTION * l2_bytes]
+    if not within_l2:
+        raise RuntimeError(f"no cell level fits the L2 budget ({L2_FRACTION:.0%} of {l2_bytes:,} bytes at "
+                           f"{COARSE_BYTES_PER_CELL} bytes per cell)")
+    if cell_edge(sides, within_l2[0]) <= widest:
         return within_l2[0]
-    narrow = [t for t in feasible if cell_edge(sides, t) <= widest]
-    return narrow[-1] if narrow else feasible[0]
+    narrow = [t for t in feasible if size(t) <= CELL_L2_MULTIPLE * L2_FRACTION * l2_bytes
+              and cell_edge(sides, t) <= widest]
+    return narrow[-1] if narrow else within_l2[0]
 
 
 def annealing_schedule(extent: float, eps: float) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:

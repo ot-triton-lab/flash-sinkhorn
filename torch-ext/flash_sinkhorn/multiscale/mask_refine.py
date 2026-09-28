@@ -110,6 +110,8 @@ def refine_mask_exact(
     cost_scale: float = 1.0,
     allow_tf32: bool = True,
     return_scores: bool = False,
+    la_block: torch.Tensor = None,
+    lb_block: torch.Tensor = None,
 ):
     """Keep the candidates whose exact tile maximum exceeds the per-pair threshold.
 
@@ -124,6 +126,8 @@ def refine_mask_exact(
         cost_scale: 1.0 for ``||x - y||^2``, 0.5 for ``||x - y||^2 / 2``.
         allow_tf32: TF32 tensor-core dot products.
         return_scores: Also return ``m_IJ`` for every candidate.
+        la_block, lb_block: The block log-masses of ``log_a`` and ``log_b``, when the caller has them
+            (the screen does); computed here otherwise.
 
     Returns:
         ``(crow, col)`` of the admitted pairs, a subset of the candidates, and,
@@ -139,8 +143,8 @@ def refine_mask_exact(
 
     N_B = crow.shape[0] - 1
     M_B = m // B
-    la_block = block_log_mass(log_a, N_B, B)
-    lb_block = block_log_mass(log_b, M_B, B)
+    la_block = block_log_mass(log_a, N_B, B) if la_block is None else la_block.contiguous()
+    lb_block = block_log_mass(log_b, M_B, B) if lb_block is None else lb_block.contiguous()
     log_drel = math.log(delta_rel)
 
     f_row = f_hat.float().masked_fill(log_a <= LOG_ZERO_SENTINEL, -torch.inf).contiguous()

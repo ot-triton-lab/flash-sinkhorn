@@ -11,7 +11,7 @@ from flash_sinkhorn.kernels import sinkhorn_blocksparse_sqeuclid
 from flash_sinkhorn.kernels.sinkhorn_blocksparse_sqeuclid import blocksparse_lse_fused
 from flash_sinkhorn.kernels.sinkhorn_splitn_sqeuclid import flashsinkhorn_lse_splitn
 from flash_sinkhorn.multiscale._preprocess import center_coords, round_to_tf32, truncate_tf32
-from flash_sinkhorn.multiscale import geometry, mask_refine
+from flash_sinkhorn.multiscale import block_mask, geometry, mask_refine
 from flash_sinkhorn.multiscale.block_mask import build_block_mask_csr, csr_transpose
 from flash_sinkhorn.multiscale.mask_refine import refine_mask_exact
 from flash_sinkhorn.multiscale.sparse_step import sparse_symmetric_step
@@ -245,6 +245,71 @@ def test_symmetric_step_repairs_empty_block_rows(B):
     g_ref = 0.5 * p["g_hat"] + 0.5 * expected(p["y"], p["x"], p["f_hat"], p["log_a"], keep.T)
     torch.testing.assert_close(f[p["a"] > 0], f_ref[p["a"] > 0], rtol=0, atol=2e-5)
     torch.testing.assert_close(g[p["b"] > 0], g_ref[p["b"] > 0], rtol=0, atol=2e-5)
+
+
+@pytest.mark.parametrize("B", BLOCKS)
+def test_box_screen_group_skip_keeps_the_same_pairs(B, monkeypatch):
+    """The group test skips only groups that hold no kept pair: the CSR equals the pair-by-pair screen's
+    bitwise, with zero-weight blocks, a whole zero-weight group and a partial last group, and most groups
+    are skipped."""
+    gen = torch.Generator(device="cpu").manual_seed(21)
+    n, m, eps = 512 * B, (4096 + 37) * B, 1e-4                         # 16 groups of 256 blocks, then 37
+    assert (m // B) % block_mask.BLOCK_J == 37
+    x, y = torch.rand(n, 3, generator=gen).cuda(), torch.rand(m, 3, generator=gen).cuda()
+    x, y = x[_morton_order(x)], y[_morton_order(y)]
+    a = torch.rand(n, generator=gen).cuda(); b = torch.rand(m, generator=gen).cuda()
+    a[5 * B:7 * B] = 0; b[300 * B:301 * B] = 0                        # zero-weight blocks on both sides
+    b[1024 * B:1280 * B] = 0                                          # a whole group of zero-weight blocks
+    a, b = a / a.sum(), b / b.sum()
+    x_lo, x_hi = _boxes(x, B)
+    y_lo, y_hi = _boxes(y, B)
+    alpha, beta = (x * x).sum(1), (y * y).sum(1)
+    f_hat = -alpha + 1e-3 * torch.randn(n, generator=gen).cuda()
+    g_hat = -beta + 1e-3 * torch.randn(m, generator=gen).cuda()
+    args = (x_lo, x_hi, y_lo, y_hi, f_hat, g_hat, alpha, beta, log_weights(a), log_weights(b), eps)
+    crow, col = build_block_mask_csr(*args, B=B, delta_rel=1e-4)
+
+    def never(y_lo, y_hi, g_bound, lb_bound):                       # groups that cannot reject
+        k = -(-y_lo.shape[0] // block_mask.BLOCK_J)
+        inf = torch.full((k, y_lo.shape[1]), float("inf"), device=y_lo.device)
+        return -inf, inf, torch.full((k,), float("inf"), device=y_lo.device), torch.zeros(k, device=y_lo.device)
+
+    monkeypatch.setattr(block_mask, "_target_groups", never)
+    crow_ref, col_ref = build_block_mask_csr(*args, B=B, delta_rel=1e-4)
+    assert torch.equal(crow, crow_ref) and torch.equal(col, col_ref)
+    kept = _csr_to_dense(crow, col, len(x_lo), len(y_lo))
+    groups = kept.view(len(x_lo), -1)[:, :(len(y_lo) // block_mask.BLOCK_J) * block_mask.BLOCK_J]
+    empty_groups = ~groups.view(len(x_lo), -1, block_mask.BLOCK_J).any(2)
+    assert bool(kept.any()) and float(empty_groups.double().mean()) > 0.5   # most (row, group) pairs are skipped
+
+
+@pytest.mark.parametrize("B", BLOCKS)
+def test_box_screen_group_screen_is_exact_at_the_threshold(B, monkeypatch):
+    """Potentials near +-1e3 that cancel to about 1e-3 put many pairs within an ulp of the threshold: the two-level
+    screen still keeps exactly the pairs of the flat one (both evaluate the same predicate code)."""
+    gen = torch.Generator(device="cpu").manual_seed(22)
+    n, m, eps = 512 * B, 1024 * B, 1e-5
+    x, y = torch.rand(n, 3, generator=gen).cuda(), torch.rand(m, 3, generator=gen).cuda()
+    x, y = x[_morton_order(x)], y[_morton_order(y)]
+    a, b = torch.full((n,), 1.0 / n, device="cuda"), torch.full((m,), 1.0 / m, device="cuda")
+    x_lo, x_hi = _boxes(x, B)
+    y_lo, y_hi = _boxes(y, B)
+    alpha, beta = (x * x).sum(1), (y * y).sum(1)
+    f_hat = 1e3 + 1e-3 * torch.randn(n, generator=gen).cuda() - alpha
+    g_hat = -1e3 + 1e-3 * torch.randn(m, generator=gen).cuda() - beta
+    args = (x_lo, x_hi, y_lo, y_hi, f_hat, g_hat, alpha, beta, log_weights(a), log_weights(b), eps)
+    crow, col = build_block_mask_csr(*args, B=B, delta_rel=1e-4)
+
+    def never(y_lo, y_hi, g_bound, lb_bound):
+        k = -(-y_lo.shape[0] // block_mask.BLOCK_J)
+        inf = torch.full((k, y_lo.shape[1]), float("inf"), device=y_lo.device)
+        return -inf, inf, torch.full((k,), float("inf"), device=y_lo.device), torch.zeros(k, device=y_lo.device)
+
+    monkeypatch.setattr(block_mask, "_target_groups", never)
+    crow_ref, col_ref = build_block_mask_csr(*args, B=B, delta_rel=1e-4)
+    assert torch.equal(crow, crow_ref) and torch.equal(col, col_ref)
+    kept = _csr_to_dense(crow, col, len(x_lo), len(y_lo))
+    assert 0.01 < float(kept.double().mean()) < 0.99                    # a real boundary, not all or nothing
 
 
 def test_launch_tables_cover_the_block_sizes():

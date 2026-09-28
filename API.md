@@ -325,7 +325,7 @@ cost = loss(x, y)  # Matches OTT-JAX's sinkhorn() output
 ```python
 loss = SamplesLoss("sinkhorn", blur=0.03, backend="multiscale", tol=5e-3)
 cost = loss(a, x, b, y)                 # x: (n, 3), y: (m, 3), CUDA
-info = loss.last_multiscale_info        # accepted, stop, B, t, fine_updates, ...
+info = loss.last_multiscale_info        # accepted, stop, detail, fine_work, B, t, fine_updates, ...
 ```
 
 The multiscale backend sorts both clouds along a Morton curve, anneals Sinkhorn on
@@ -349,19 +349,29 @@ warns and returns its best candidate with `accepted=False`.
   not debiased, as with the symmetric backend), and the cost path raises for inputs
   that require gradients.
 - The coarse cells are kept at most 9 blurs wide where the cell-count limits allow it, even
-  beyond the L2 budget: wider cells can lift potentials that leave rows so short of mass that
-  the fine masks prune them whole. Clouds smaller than about 8192 points per side are annealed on
-  the points themselves.
-- The fine stage stops once its sampled score has improved by less than 1% over three
-  consecutive windows of 64 updates, or after 2048 updates. It stops as unstable when a mask
-  admits no tile for more than 1% of the block rows of positive mass on either side (before
-  repairing them), and when two checks in a row give no finite score. The solve then warns and
-  sets `accepted=False` (`info.stop` is `"stalled"`, `"unstable"` or `"ceiling"`).
+  beyond the L2 budget but never beyond twice it: wider cells can lift potentials that leave rows
+  so short of mass that the fine masks prune them whole, and the dense coarse updates cost the
+  square of the cell count. When no level within twice the budget is narrow enough, the finest
+  level within the L2 budget is kept. Clouds smaller than about 8192 points per side are annealed
+  on the points themselves; a GPU whose L2 budget holds no cell level is refused.
+- The fine stage stops once its sampled score has improved by less than 1% over three consecutive windows
+  of 64 updates, or after 2048 updates. It stops as unstable when densely repairing a mask's empty block
+  rows of positive mass would cost more than one of the update's sparse half-steps, and when two checks
+  in a row give no finite score. It stops on its budget before any update whose estimated work would take
+  it past 4·10⁸ point pairs per point, (n + m)/2 points, previews included (`info.fine_work` is the
+  estimated work of the updates; retries are not counted). It stops as too large when a mask or an update
+  would exceed the int32 indices or the device memory; candidates that do not fit one CSR, or whose
+  refinement runs out of memory, are screened and refined in smaller chunks of block rows first. The
+  solve then warns and returns its best candidate with `accepted=False` (`info.stop` is `"stalled"`,
+  `"unstable"`, `"ceiling"`, `"budget"` or `"too large"`, and `info.detail` says why).
+- In sparse updates, empty block rows of zero mass keep their incoming potentials and are never
+  repaired; at the end every point of zero weight gets its c-transform against the returned
+  potentials of the other side.
 - `flash_sinkhorn.multiscale.solve_multiscale(x, y, a, b, eps, tol)` is the solver itself.
   It returns `(f, g, info)` for the full cost `||x − y||²` and expects clouds already passed
   through `flash_sinkhorn.multiscale.preprocess_coordinates`; unrounded coordinates are rejected,
-  and the weights must sum to one within `min(1e-3, tol / 4)` (so must `SamplesLoss` weights
-  with `normalize=False`).
+  the weights must sum to one within `min(1e-3, tol / 4)` (so must `SamplesLoss` weights with
+  `normalize=False`), and each cloud may hold at most 2^27 points.
 
 ### Custom Epsilon Schedule
 

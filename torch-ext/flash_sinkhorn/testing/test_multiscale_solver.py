@@ -130,8 +130,34 @@ def test_unequal_sizes_nonuniform_and_zero_weights():
     xp, yp, f, g, info = solve(x, y, a, b, 1e-2)
     assert info.accepted
     ka, kb = a > 0, b > 0
-    assert torch.isfinite(f[ka]).all() and torch.isfinite(g[kb]).all()
+    assert torch.isfinite(f).all() and torch.isfinite(g).all()
     assert max(residuals(xp[ka], yp[kb], a[ka], b[kb], f[ka], g[kb], 1e-2)) <= 1.1 * TOL
+    # Whatever the returned kind (a lift too), every zero-weight point gets its c-transform.
+    torch.testing.assert_close(f[~ka], transform(xp[~ka], yp, b, g, 1e-2), rtol=0, atol=2e-5)
+    torch.testing.assert_close(g[~kb], transform(yp[~kb], xp, a, f, 1e-2), rtol=0, atol=2e-5)
+
+
+@cuda
+def test_zero_weight_blocks_are_held_and_transformed_at_the_end():
+    """A region of zero weight makes whole zero-weight blocks: the fine updates hold them (no dense repair), and
+    the returned potentials of every zero-weight point are their c-transforms against the other side."""
+    x, y = clustered(2**14, 40), clustered(2**14, 41)
+    a, b = uniform_weights(2**14), uniform_weights(2**14)
+    ball = lambda p, k: (p - p[k]).norm(dim=1) < torch.quantile((p - p[k]).norm(dim=1), 0.1)
+    a = torch.where(ball(x, 0), 0.0, a)                                   # compact regions: whole blocks
+    b = torch.where(ball(y, 7), 0.0, b)
+    a, b = a / a.sum(), b / b.sum()
+    xp, yp, f, g, info = solve(x, y, a, b, 1e-3)
+    assert info.accepted and info.returned != "lift" and info.fine_updates > 0
+    joint = geometry.joint_sort(xp, yp, a, b)
+    for cloud in (joint.source, joint.target):                            # whole zero-weight blocks exist
+        w = torch.nn.functional.pad(cloud.weights, (0, (-cloud.n) % info.B))
+        assert int((w.view(-1, info.B).sum(1) == 0).sum()) >= 2
+    za, zb = a == 0, b == 0
+    assert torch.isfinite(f).all() and torch.isfinite(g).all()
+    torch.testing.assert_close(f[za], transform(xp[za], yp, b, g, 1e-3), rtol=0, atol=2e-5)
+    torch.testing.assert_close(g[zb], transform(yp[zb], xp, a, f, 1e-3), rtol=0, atol=2e-5)
+    assert max(residuals(xp[~za], yp[~zb], a[~za], b[~zb], f[~za], g[~zb], 1e-3)) <= 1.1 * TOL
 
 
 @cuda
@@ -272,7 +298,125 @@ def test_not_confirmed_returns_best_candidate():
 
 
 @cuda
-def test_argument_validation():
+def test_admitted_mask_in_chunks_equals_one_pass(monkeypatch):
+    """Candidates too many for one CSR are screened and refined in chunks of block rows; the admitted
+    mask is the one-pass mask, bitwise, with lognormal weights and a zero-weight block."""
+    x, y = clustered(2**15, 30), clustered(2**15, 31)
+    gen = torch.Generator(device="cpu").manual_seed(30)
+    a = torch.exp(torch.randn(2**15, generator=gen, dtype=torch.float64))    # lognormal weights, so block
+    b = torch.exp(torch.randn(2**15, generator=gen, dtype=torch.float64))    # log-masses are not exact sums
+    a, b = (a / a.sum()).float().cuda(), (b / b.sum()).float().cuda()
+    xp, yp = preprocess_coordinates(x, y, a, b)
+    joint = geometry.joint_sort(xp, yp, a, b)
+    a_sorted = joint.source.weights.clone()
+    a_sorted[640:704] = 0                                                  # one zero-weight source block
+    a = torch.empty_like(a).index_put_((joint.source.perm,), a_sorted)
+    a = a / a.sum()
+    joint = geometry.joint_sort(xp, yp, a, b)
+    sx, sy = geometry.block_summaries(joint.source), geometry.block_summaries(joint.target)
+    geo = geometry.execution_geometry(joint, 64, sx, sy)
+    eps = 3e-3
+    f, g, _ = solve_multiscale(xp, yp, a, b, eps, TOL)                          # potentials that mean something
+    state = fine.warm_state(geo, f, g)
+    one = fine.admitted_mask(geo, state, eps, fine.mask_delta_rel(geo, TOL))
+    capacity = max(1, one[0] // 7)
+    monkeypatch.setattr(block_mask, "csr_capacity", lambda *args: capacity)
+    chunked = fine.admitted_mask(geo, state, eps, fine.mask_delta_rel(geo, TOL))
+    assert one[0] == chunked[0] and one[0] > 7 * geo["N_B"]
+    assert torch.equal(one[1], chunked[1]) and torch.equal(one[2], chunked[2])
+
+
+@cuda
+def test_mask_too_large_stops_the_fine_stage(monkeypatch):
+    """A mask no CSR can hold stops the fine stage as "too large": the best candidate is returned,
+    finite, with accepted=False, and SamplesLoss warns."""
+    x, y, a = clustered(2**14, 32), clustered(2**14, 33), uniform_weights(2**14)
+    xp, yp = preprocess_coordinates(x, y, a, a)
+    monkeypatch.setattr(block_mask, "csr_capacity", lambda *args: 0)
+    f, g, info = solve_multiscale(xp, yp, a, a, 1e-3, TOL)
+    assert not info.accepted and info.stop == "too large" and info.fine_updates == 0 and "CSR" in info.detail
+    assert torch.isfinite(f).all() and torch.isfinite(g).all()
+    with pytest.warns(RuntimeWarning, match=r"OT\(a, b\) stopped as too large.*int32 indices"):
+        SamplesLoss("sinkhorn", blur=1e-3 ** 0.5, backend="multiscale")(x, y)
+
+
+@cuda
+def test_work_budget_stops_the_fine_stage(monkeypatch):
+    """Fine updates and previews check their estimated point pairs before launch; the next update past
+    WORK_PER_POINT pairs per point stops the stage as "budget" with the best candidate, within the budget."""
+    n = 2**14
+    x, y, a = clustered(n, 34), clustered(n, 35), uniform_weights(n)
+    xp, yp = preprocess_coordinates(x, y, a, a)
+    f, g, info = solve_multiscale(xp, yp, a, a, 1e-3, 1e-9)                  # never confirmed
+    assert info.stop in ("stalled", "ceiling") and info.fine_work > 0
+    assert info.fine_work <= solver.WORK_PER_POINT * n
+    monkeypatch.setattr(solver, "WORK_PER_POINT", 4 * n)                    # four dense iterations in all
+    f, g, info = solve_multiscale(xp, yp, a, a, 1e-3, 1e-9)
+    assert (info.accepted, info.stop) == (False, "budget") and "pairs per point" in info.detail
+    assert 0 < info.fine_updates < solver.FINE_WINDOW and 0 < info.fine_work <= 4 * n * n
+    assert torch.isfinite(f).all() and torch.isfinite(g).all()
+
+
+@cuda
+def test_dense_updates_stop_on_the_budget_and_on_memory(monkeypatch):
+    """A dense update (the whole cloud within a blur) is charged 2 n m pairs before launch, and one that runs
+    out of device memory stops the fine stage as too large; both return the lift, finite."""
+    n = 2**12
+    x, y, a = clustered(n, 36), clustered(n, 37), uniform_weights(n)
+    xp, yp = preprocess_coordinates(x, y, a, a)
+    eps = 1.0
+    monkeypatch.setattr(solver, "WORK_PER_POINT", 1.5 * n)                  # less than one dense update
+    f, g, info = solve_multiscale(xp, yp, a, a, eps, 1e-9)
+    assert (info.accepted, info.stop, info.fine_updates) == (False, "budget", 0) and "a dense update" in info.detail
+    assert info.returned == "lift" and torch.isfinite(f).all() and torch.isfinite(g).all()
+    monkeypatch.undo()
+
+    def refuse(*args, **kwargs):
+        raise torch.cuda.OutOfMemoryError("refused")
+
+    monkeypatch.setattr(fine, "flashsinkhorn_symmetric_step", refuse)
+    f, g, info = solve_multiscale(xp, yp, a, a, eps, 1e-9)
+    assert (info.stop, info.fine_updates) == ("too large", 0) and "dense update" in info.detail
+    assert "refused" in info.detail and info.returned == "lift" and torch.isfinite(f).all()
+
+
+@cuda
+def test_admitted_mask_backs_off_after_out_of_memory(monkeypatch):
+    """A refinement that runs out of device memory is retried on fewer block rows; the admitted mask is the
+    one-pass mask, bitwise. A single block row that does not fit stops the fine stage as too large."""
+    n, eps = 2**14, 1e-3
+    x, y, a = clustered(n, 40), clustered(n, 41), uniform_weights(n)
+    xp, yp = preprocess_coordinates(x, y, a, a)
+    joint = geometry.joint_sort(xp, yp, a, a)
+    sx, sy = geometry.block_summaries(joint.source), geometry.block_summaries(joint.target)
+    geo = geometry.execution_geometry(joint, 64, sx, sy)
+    f, g, _ = solve_multiscale(xp, yp, a, a, eps, TOL)
+    state = fine.warm_state(geo, f, g)
+    delta_rel = fine.mask_delta_rel(geo, TOL)
+    one = fine.admitted_mask(geo, state, eps, delta_rel)
+    refine, rows = fine.refine_mask_exact, []
+
+    def small_only(x, *args, **kwargs):
+        rows.append(len(x) // 64)
+        if len(x) > 64 * (geo["N_B"] // 5):
+            raise torch.cuda.OutOfMemoryError("refused")
+        return refine(x, *args, **kwargs)
+
+    monkeypatch.setattr(fine, "refine_mask_exact", small_only)
+    backed = fine.admitted_mask(geo, state, eps, delta_rel)
+    assert rows[0] == geo["N_B"] and len(rows) > 5 and max(rows[1:]) < geo["N_B"]
+    assert one[0] == backed[0] and torch.equal(one[1], backed[1]) and torch.equal(one[2], backed[2])
+
+    def never(*args, **kwargs):
+        raise torch.cuda.OutOfMemoryError("refused")
+
+    monkeypatch.setattr(fine, "refine_mask_exact", never)
+    with pytest.raises(fine.MaskTooLarge, match="alone does not fit in device memory"):
+        fine.admitted_mask(geo, state, eps, delta_rel)
+
+
+@cuda
+def test_argument_validation(monkeypatch):
     with pytest.raises(ValueError, match="tol applies only"):
         SamplesLoss("sinkhorn", tol=1e-3)
     for kwargs in (dict(reach=1.0), dict(eps=1e-2), dict(eps_list=[1e-2]), dict(n_iters=10),
@@ -310,7 +454,23 @@ def test_argument_validation():
         solve_multiscale(x.cpu(), y.cpu(), a.cpu(), a.cpu(), 1e-2, TOL)
     with pytest.raises(ValueError, match="TF32-rounded"):
         solve_multiscale(x, y, a, a, 1e-2, TOL)  # raw coordinates
+    assert solver.MAX_POINTS == 2**27
+    monkeypatch.setattr(solver, "MAX_POINTS", 1000)
+    with pytest.raises(ValueError, match="at most 1,000 points per side"):
+        solver._validate(x, y, a, a, TOL)
+    monkeypatch.undo()
+    for name, bad in (("x", 0), ("y", 1), ("a", 2), ("b", 3)):
+        args = [x.clone(), y.clone(), a.clone(), a.clone()]
+        args[bad][1] = float("nan")          # a NaN weight would pass the sum test (NaN comparisons are false)
+        with pytest.raises(ValueError, match=f"{name} must be finite"):
+            solver._validate(*args, TOL)
     xp, yp = preprocess_coordinates(x, y, a, a)
+    with pytest.raises(ValueError, match="overflow fp32 potentials"):
+        solve_multiscale(xp, yp, a, a, 1e-45, TOL)
+    huge = xp.double()
+    huge[0, 0] = 1e39                                  # finite in fp64 and TF32-rounded, infinite in fp32
+    with pytest.raises(ValueError, match="x is not finite in fp32"):
+        solve_multiscale(huge, yp, a, a, 1e-2, TOL)
     heavy = a * (1 + 2e-4)
     solver._validate(xp, yp, heavy, a, TOL)          # within min(1e-3, tol / 4)
     with pytest.raises(ValueError, match="sum to one within"):
@@ -380,14 +540,16 @@ def test_memory_admission():
 
 
 @cuda
-def test_refused_mask_raises(monkeypatch):
-    def refuse(*args):
+def test_refused_mask_stops_as_too_large(monkeypatch):
+    """A mask the memory admission refuses stops the fine stage as too large, with the best candidate."""
+    def refuse(*args, **kwargs):
         raise torch.cuda.OutOfMemoryError("refused")
 
     monkeypatch.setattr(block_mask, "csr_memory_admission", refuse)
     x, y, a = clustered(2**14, 18), clustered(2**14, 19), uniform_weights(2**14)
-    with pytest.raises(torch.cuda.OutOfMemoryError, match="refused"):
-        solve(x, y, a, a, 1e-3)
+    _, _, f, g, info = solve(x, y, a, a, 1e-3)
+    assert (info.accepted, info.stop, info.fine_updates) == (False, "too large", 0) and "refused" in info.detail
+    assert torch.isfinite(f).all() and torch.isfinite(g).all()
 
 
 # ---------------------------------------------------------------------------
@@ -486,10 +648,21 @@ def test_cell_level_rule():
     box = (float(geometry.MAX_QUANTIZED),) * 3
     blurs = lambda w: (w / geometry.CELL_EDGE_BLURS) ** 2  # the eps whose blur-scaled width is w
     assert geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 2**20, box, blurs(600)) == 27
-    assert geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 2**20, box, blurs(200)) == 21
-    assert geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 2**20, box, blurs(100)) == 18
-    # No level within the cell limit (t >= 18) is narrow enough: the finest one allowed.
-    assert geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 2**20, box, blurs(50)) == 18
+    # ... but within CELL_L2_MULTIPLE = 2 budgets (7489 cells per side here): t = 21 (8192) and t = 18 (16384)
+    # are narrow enough only beyond it, so the finest level within the L2 budget is kept, t = 27 (2048).
+    assert geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 2**20, box, blurs(200)) == 27
+    assert geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 2**20, box, blurs(100)) == 27
+    # With a 4 MiB L2 (2 budgets: 29,959 cells) the coarsest narrow level is within it: t = 21, and t = 18.
+    assert geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 4 * 2**20, box, blurs(200)) == 21
+    assert geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 4 * 2**20, box, blurs(100)) == 18
+    # No level within the cell limit (t >= 18) is narrow enough: the finest within the L2 budget, not the
+    # finest allowed (the width is out of reach either way, and finer cells cost the square of their count).
+    assert geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 2**20, box, blurs(50)) == 27
+    # With the cell limit inside the L2 budget (as at every size up to 2^22 with a 40 MiB L2) the two coincide.
+    assert geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 40 * 2**20, box, blurs(50)) == 18
+    # An L2 too small for even the coarsest level (one cell per side, 224 bytes) is refused.
+    with pytest.raises(RuntimeError, match="no cell level fits the L2 budget"):
+        geometry.choose_cell_level(counts, counts, 2**20, 2**20, 128, 200, box, blurs(50))
     # The constant itself, on boxes that fill their cells: a 2^27-point cube 512 blurs wide needs t = 45
     # (cells 8 blurs wide; t = 46 gives 16), while a 2^24-point box 273-276 blurs wide keeps t = 46 (8.54).
     eps = (1000 / 512) ** 2
@@ -524,7 +697,7 @@ def _mocked_fine_stage(monkeypatch, score, accept=lambda kind, h: False, termina
     the previews) is refused as unstable."""
     progress = dict(h=0, kind="lift")
 
-    def fake_fine_step(geo, state, eps, delta_rel, *, alpha=0.5):
+    def fake_fine_step(geo, state, eps, delta_rel, *, alpha=0.5, work_left=None):
         if (unstable_from is not None and state.ordinary_steps >= unstable_from
                 and (alpha == 1.0 or not unstable_previews_only)):
             raise fine.UnstableMask("mocked")
@@ -593,6 +766,8 @@ def test_fine_stage_stops_as_unstable(monkeypatch):
 
 @cuda
 def test_fine_step_refuses_masks_with_empty_block_rows(monkeypatch):
+    """Empty block rows of positive mass are repaired densely only while that costs no more than one of the
+    update's sparse half-steps (REPAIR_COST_RATIO); beyond it the mask is unstable."""
     n, eps = 2**14, 1e-3
     x, y, a = clustered(n, 0), clustered(n, 1), uniform_weights(n)
     xp, yp = preprocess_coordinates(x, y, a, a)
@@ -616,15 +791,26 @@ def test_fine_step_refuses_masks_with_empty_block_rows(monkeypatch):
         return refine_k
 
     fine.fine_step(geo, state, eps, delta_rel)
-    monkeypatch.setattr(fine, "refine_mask_exact", emptying(2))  # 0.8% of the block rows
-    fine.fine_step(geo, state, eps, delta_rel)
-    monkeypatch.setattr(fine, "refine_mask_exact", emptying(3))  # 1.2%
-    with pytest.raises(fine.UnstableMask):
-        fine.fine_step(geo, state, eps, delta_rel)
-    monkeypatch.setattr(fine, "refine_mask_exact", emptying(3, side="target"))
-    with pytest.raises(fine.UnstableMask):
-        fine.fine_step(geo, state, eps, delta_rel)
-    # Zero-weight block rows admit nothing and are not counted.
+    B = geo["B"]
+    for side in ("source", "target"):
+        between = []                           # repairs costing between one and two half-steps
+        for k in range(1, 201):
+            monkeypatch.setattr(fine, "refine_mask_exact", emptying(k, side))
+            _, _, col = fine.admitted_mask(geo, state, eps, delta_rel)
+            repair, half = k * B * len(geo["y_s"]), int(col.numel()) * B * B
+            if half < repair <= 2 * half:
+                between.append(k)
+            elif k not in (1, 200):
+                continue
+            aborts = repair > fine.REPAIR_COST_RATIO * half
+            assert aborts == (k != 1)          # one empty block row is repaired, 200 of 256 are not
+            if aborts:
+                with pytest.raises(fine.UnstableMask, match="repairing them densely"):
+                    fine.fine_step(geo, state, eps, delta_rel)
+            else:
+                fine.fine_step(geo, state, eps, delta_rel)
+        assert between                         # the rule is one half-step, not both
+    # Zero-weight block rows admit nothing, are held instead of repaired, and cost nothing.
     monkeypatch.setattr(fine, "refine_mask_exact", refine)
     geo["log_a"] = geo["log_a"].clone()
     geo["log_a"][:3 * 64] = block_mask.LOG_ZERO_SENTINEL

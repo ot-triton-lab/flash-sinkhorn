@@ -5,6 +5,8 @@ update reads the mask, the target update reads its transpose, and each result is
 averaged with its input. A block row with no admitted tile would have an empty
 sum; those rows alone are recomputed against every point of the other cloud, by
 a streaming kernel that splits the target dimension. No ``n x m`` matrix is formed.
+A block row of zero weight carries no mass: it keeps its incoming potential instead
+(its points get their dense c-transform once, for the returned pair).
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import triton.language as tl
 
 from ..kernels._triton_helpers import _final_lse, _tiled_dot
 from ..kernels.sinkhorn_blocksparse_sqeuclid import blocksparse_lse_fused
+from .block_mask import LOG_ZERO_SENTINEL, block_log_mass
 
 #: Tile of the dense repair kernel (rows, columns, dot K-slice).
 REPAIR_TILE = 64
@@ -114,13 +117,18 @@ def dense_lse_rows(x, y, g_hat, log_w, eps, damping, *, cost_scale=1.0,
 
 
 def _half_step(x, y, g_hat, log_w, eps, damping, crow, col, *, block, cost_scale,
-               allow_tf32, use_exp2):
-    """Sparse half-step; rows of empty block rows are replaced by the dense result."""
+               allow_tf32, use_exp2, live=None, held=None):
+    """Sparse half-step; rows of empty block rows are replaced by the dense result, except those of
+    empty block rows that are not ``live`` (zero weight), which take ``held`` (their incoming values)."""
     out = blocksparse_lse_fused(
         x, y, g_hat, log_w, eps, damping, crow, col,
         block_m=block, block_n=block, cost_scale=cost_scale,
         allow_tf32=allow_tf32, use_exp2=use_exp2)
-    empty = torch.nonzero(crow[1:] == crow[:-1], as_tuple=False).flatten()
+    empty_rows = crow[1:] == crow[:-1]
+    if live is not None:
+        out = torch.where((empty_rows & ~live).repeat_interleave(block), held, out)
+        empty_rows = empty_rows & live
+    empty = torch.nonzero(empty_rows, as_tuple=False).flatten()
     blocks_per_chunk = max(1, REPAIR_QUERY_CHUNK // block)
     offsets = torch.arange(block, device=x.device)
     for first in range(0, len(empty), blocks_per_chunk):
@@ -153,6 +161,8 @@ def sparse_symmetric_step(
         ``((1 - alpha) f_hat + alpha f_new, (1 - alpha) g_hat + alpha g_new)``.
     """
     common = dict(block=block, cost_scale=cost_scale, allow_tf32=allow_tf32, use_exp2=use_exp2)
-    f_new = _half_step(x, y, g_hat, log_b, eps, 1., crow, col, **common)
-    g_new = _half_step(y, x, f_hat, log_a, eps, 1., crow_t, col_t, **common)
+    live_x = block_log_mass(log_a, len(crow) - 1, block) > LOG_ZERO_SENTINEL / 2
+    live_y = block_log_mass(log_b, len(crow_t) - 1, block) > LOG_ZERO_SENTINEL / 2
+    f_new = _half_step(x, y, g_hat, log_b, eps, 1., crow, col, live=live_x, held=f_hat, **common)
+    g_new = _half_step(y, x, f_hat, log_a, eps, 1., crow_t, col_t, live=live_y, held=g_hat, **common)
     return (1. - alpha) * f_hat + alpha * f_new, (1. - alpha) * g_hat + alpha * g_new

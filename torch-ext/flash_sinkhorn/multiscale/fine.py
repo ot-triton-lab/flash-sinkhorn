@@ -16,7 +16,8 @@ import torch
 import torch.nn.functional as F
 
 from ..kernels.sinkhorn_flashstyle_sqeuclid import flashsinkhorn_symmetric_step
-from .block_mask import LOG_ZERO_SENTINEL, block_log_mass, build_block_mask_csr, csr_transpose
+from . import block_mask
+from .block_mask import LOG_ZERO_SENTINEL, block_log_mass, csr_transpose
 from .mask_refine import refine_mask_exact
 from .sparse_step import sparse_symmetric_step
 
@@ -25,13 +26,32 @@ from .sparse_step import sparse_symmetric_step
 GEOMETRY_DELTA = 1e-10
 # Omitted mass of the whole mask, summed over rows or columns, is at most tol / MASK_TOL_DIVISOR.
 MASK_TOL_DIVISOR = 4
-# A mask that admits no block for more than 1% of either side's block rows (of positive mass) is unstable.
-EMPTY_ROW_LIMIT = 0.01
+# The dense repair of a mask's empty block rows (of positive mass, both sides together) may cost at most this
+# multiple of one of the update's sparse half-steps; a mask that needs more is unstable.
+REPAIR_COST_RATIO = 1
 
 
 class UnstableMask(RuntimeError):
     """The fine masks have stopped describing the transport: the potentials left some rows so short of
-    mass that whole block rows were pruned, and repairing them densely would cost more than the solve."""
+    mass that whole block rows were pruned, and repairing them densely would cost more than the update."""
+
+
+class MaskTooLarge(RuntimeError):
+    """The mask an update needs exceeds the int32 indices or the device memory: the fine stage cannot run
+    at this blur and size."""
+
+
+class WorkBudget(RuntimeError):
+    """The next fine update would exceed the fine stage's work budget (solver.WORK_PER_POINT)."""
+
+
+def _attempt(fn):
+    """``(fn(), None)``, or ``(None, message)`` on a device out-of-memory error. A retry happens outside the
+    handler, after the failed attempt's tensors are released."""
+    try:
+        return fn(), None
+    except torch.cuda.OutOfMemoryError as ex:
+        return None, str(ex).split("\n")[0][:200] or "out of device memory"
 
 
 @dataclass(frozen=True)
@@ -40,6 +60,7 @@ class FineState:
     g_hat: torch.Tensor
     ordinary_steps: int = 0
     kind: str = "ordinary"  # "terminal" for an unaveraged preview, which never continues
+    work: int = 0  # pair evaluations of the fine updates that led here (refinement, half-steps, repairs)
 
 
 def mask_delta_rel(geo: dict, tol: float) -> float:
@@ -65,40 +86,131 @@ def dense_by_geometry(geo: dict, eps: float) -> bool:
 
 
 @torch.no_grad()
-def fine_step(geo: dict, state: FineState, eps: float, delta_rel: float, *, alpha: float = 0.5):
+def fine_step(geo: dict, state: FineState, eps: float, delta_rel: float, *, alpha: float = 0.5,
+              work_left: float = None):
     """One symmetric update; ``alpha`` 1/2 continues the solve, 1 gives a terminal preview.
 
     Returns the new state and ``(candidate tiles, admitted tiles)``, or ``None`` for a dense update.
+    Raises WorkBudget before any launch whose estimated work exceeds ``work_left`` point pairs (retries
+    are not counted), UnstableMask for non-finite potentials or an unaffordable repair, and MaskTooLarge
+    when the update does not fit the int32 indices or the device memory.
     """
     if state.kind != "ordinary":
         raise ValueError("a terminal preview cannot be continued")
     B = geo["B"]
     x, y = geo["x_s"], geo["y_s"]
+    if bool((~torch.isfinite(state.f_hat) & (geo["a_s"] > 0)).any() | (~torch.isfinite(state.g_hat) & (geo["b_s"] > 0)).any()):
+        raise UnstableMask("the potentials are not finite on points of positive mass")
+
+    def affordable(work: float, what: str):
+        if work_left is not None and work > work_left:
+            raise WorkBudget(f"{what} would evaluate {work:.3g} point pairs, more than the {work_left:.3g} left")
+
     if dense_by_geometry(geo, eps):
-        f, g = flashsinkhorn_symmetric_step(
+        work = 2 * len(x) * len(y)
+        affordable(work, "a dense update")
+        result, err = _attempt(lambda: flashsinkhorn_symmetric_step(
             x, y, state.f_hat, state.g_hat, geo["log_a"], geo["log_b"], eps, cost_scale=1.0,
-            alpha=alpha, damping_f=1.0, damping_g=1.0, allow_tf32=True, use_exp2=True, autotune=True)
+            alpha=alpha, damping_f=1.0, damping_g=1.0, allow_tf32=True, use_exp2=True, autotune=True))
+        if err:
+            raise MaskTooLarge(f"a dense update does not fit in device memory: {err}")
+        f, g = result
         tiles = None
     else:
-        crow, col = build_block_mask_csr(
-            geo["x_lo"], geo["x_hi"], geo["y_lo"], geo["y_hi"], state.f_hat, state.g_hat,
-            geo["alpha"], geo["beta"], geo["log_a"], geo["log_b"], eps, B=B, delta_rel=delta_rel)
-        candidates = int(col.numel())
-        crow, col = refine_mask_exact(x, y, state.f_hat, state.g_hat, geo["log_a"], geo["log_b"], eps,
-                                      crow, col, B=B, delta_rel=delta_rel)
-        crow_t, col_t = csr_transpose(crow, col, geo["N_B"], geo["M_B"])
-        empty = max(_empty_fraction(crow, geo["log_a"], B), _empty_fraction(crow_t, geo["log_b"], B))
-        if empty > EMPTY_ROW_LIMIT:
-            raise UnstableMask(f"the mask admits no block for {empty:.1%} of one side's block rows")
-        f, g = sparse_symmetric_step(x, y, state.f_hat, state.g_hat, geo["log_a"], geo["log_b"], eps,
-                                     crow, col, crow_t, col_t, block=B, alpha=alpha)
+        candidates, crow, col = admitted_mask(geo, state, eps, delta_rel, work_left)
+        half = int(col.numel()) * B * B
+        result, err = _attempt(lambda: csr_transpose(crow, col, geo["N_B"], geo["M_B"]))
+        if err:
+            raise MaskTooLarge(f"the transpose of a {int(col.numel()):,}-tile mask does not fit: {err}")
+        crow_t, col_t = result
+        empty_x, empty_y = _empty_rows(crow, geo["log_a"], B), _empty_rows(crow_t, geo["log_b"], B)
+        repair = (empty_x * len(y) + empty_y * len(x)) * B
+        if repair > REPAIR_COST_RATIO * half:
+            raise UnstableMask(f"the mask admits no block for {empty_x} source and {empty_y} target block rows of "
+                               f"positive mass; repairing them densely ({repair:.3g} pair evaluations) would cost "
+                               f"more than a sparse half-step ({half:.3g})")
+        work = candidates * B * B + 2 * half + repair
+        affordable(work, "the half-steps and repairs")
+        result, err = _attempt(lambda: sparse_symmetric_step(
+            x, y, state.f_hat, state.g_hat, geo["log_a"], geo["log_b"], eps, crow, col, crow_t, col_t,
+            block=B, alpha=alpha))
+        if err:
+            raise MaskTooLarge(f"the half-steps of a {int(col.numel()):,}-tile mask do not fit: {err}")
+        f, g = result
         tiles = (candidates, int(col.numel()))
     ordinary = alpha == 0.5
-    new = FineState(f, g, state.ordinary_steps + int(ordinary), "ordinary" if ordinary else "terminal")
+    new = FineState(f, g, state.ordinary_steps + int(ordinary), "ordinary" if ordinary else "terminal",
+                    state.work + work)
     return new, tiles
 
 
-def _empty_fraction(crow: torch.Tensor, log_w: torch.Tensor, B: int) -> float:
-    """Share of the block rows of positive mass that admit no block (zero-weight blocks never do)."""
+@torch.no_grad()
+def admitted_mask(geo: dict, state: FineState, eps: float, delta_rel: float, work_left: float = None):
+    """``(candidates, crow, col)``: the box screen's candidates refined exactly into the admitted mask.
+
+    When the candidates do not fit one CSR, or a refinement runs out of device memory, consecutive
+    chunks of block rows (fewer after each failure) are screened and refined in turn and only their
+    admitted tiles are kept; the admitted CSR is the same. Raises MaskTooLarge when a single block row
+    or the admitted mask does not fit, and WorkBudget before a refinement past ``work_left``.
+    """
+    B = geo["B"]
+    x, y = geo["x_s"], geo["y_s"]
+    try:
+        screen, err = _attempt(lambda: block_mask.prepare_screen(
+            geo["x_lo"], geo["x_hi"], geo["y_lo"], geo["y_hi"], state.f_hat, state.g_hat,
+            geo["alpha"], geo["beta"], geo["log_a"], geo["log_b"], eps, B=B, delta_rel=delta_rel))
+    except block_mask.CSRCapacityError as ex:
+        raise MaskTooLarge(f"the group screen exceeds the int32 indices: {ex}") from None
+    if err:
+        raise MaskTooLarge(f"the group screen does not fit in device memory: {err}")
+    N_B, M_B = screen["N_B"], screen["M_B"]
+    counts = block_mask.screen_counts(screen)
+    counts64 = counts.to(torch.int64)
+    candidates = int(counts64.sum())
+    if work_left is not None and candidates * B * B > work_left:
+        raise WorkBudget(f"refining {candidates:,} candidate tiles would evaluate {candidates * B * B:.3g} point "
+                         f"pairs, more than the {work_left:.3g} left")
+
+    def refine(r0: int, r1: int):
+        crow_c, col_c = block_mask.screen_fill(screen, counts, r0, r1)
+        return refine_mask_exact(x[r0 * B:r1 * B], y, state.f_hat[r0 * B:r1 * B], state.g_hat,
+                                 geo["log_a"][r0 * B:r1 * B], geo["log_b"], eps, crow_c, col_c,
+                                 B=B, delta_rel=delta_rel, la_block=screen["rows"][3][r0:r1],
+                                 lb_block=screen["cols"][3])
+
+    ends = torch.cumsum(counts64, 0).cpu()
+    rows_admitted, cols, admitted, r0, most = [], [], 0, 0, N_B
+    while r0 < N_B:
+        room = block_mask.csr_capacity(N_B, M_B, screen["device"])
+        base = int(ends[r0 - 1]) if r0 else 0
+        r1 = min(N_B, r0 + most, max(r0 + 1, int(torch.searchsorted(ends, base + room, right=True))))
+        if int(ends[r1 - 1]) - base > room:
+            raise MaskTooLarge(f"block row {r0} alone has more candidates than a CSR can hold ({room:,})")
+        result, err = _attempt(lambda: refine(r0, r1))
+        if err:
+            if r1 - r0 == 1:
+                raise MaskTooLarge(f"block row {r0} alone does not fit in device memory: {err}")
+            most = (r1 - r0) // 2                          # strictly fewer rows on the next attempt
+            continue
+        crow_r, col_r = result
+        admitted += int(col_r.numel())
+        if admitted > block_mask.CSR_INDEX_MAX:
+            raise MaskTooLarge(f"the admitted mask exceeds {block_mask.CSR_INDEX_MAX:,} tiles "
+                               f"({candidates:,} candidates)")
+        rows_admitted.append(crow_r[1:] - crow_r[:-1])
+        cols.append(col_r)
+        r0 = r1
+    if len(cols) == 1:
+        return candidates, crow_r, cols[0]
+    result, err = _attempt(lambda: (torch.cat(rows_admitted).cumsum(0), torch.cat(cols)))
+    if err:
+        raise MaskTooLarge(f"the admitted mask of {admitted:,} tiles does not fit in device memory: {err}")
+    crow = torch.zeros(N_B + 1, dtype=torch.int32, device=screen["device"])
+    crow[1:] = result[0]
+    return candidates, crow, result[1]
+
+
+def _empty_rows(crow: torch.Tensor, log_w: torch.Tensor, B: int) -> int:
+    """Block rows of positive mass that admit no block (zero-weight blocks never do, and are not repaired)."""
     live = block_log_mass(log_w, len(crow) - 1, B) > LOG_ZERO_SENTINEL / 2
-    return float(((crow[1:] == crow[:-1]) & live).sum()) / max(1, int(live.sum()))
+    return int(((crow[1:] == crow[:-1]) & live).sum())

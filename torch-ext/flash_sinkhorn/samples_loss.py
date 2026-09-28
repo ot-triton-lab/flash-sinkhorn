@@ -586,28 +586,36 @@ class SamplesLoss(torch.nn.Module):
         eps = self.blur ** 2 / s
         not_accepted = []
 
-        def solve(x, y, a, b):
+        def solve(x, y, a, b, name):
             f, g, info = solve_multiscale(x, y, a, b, eps, self.tol)
             if not info.accepted:
-                not_accepted.append(info)
+                not_accepted.append((name, info))
             return s * f, s * g, info
 
         a, b = parsed.a.detach().float().contiguous(), parsed.b.detach().float().contiguous()
         x, y = preprocess_coordinates(parsed.x, parsed.y, a, b)
-        f, g, self.last_multiscale_info = solve(x, y, a, b)
+        f, g, self.last_multiscale_info = solve(x, y, a, b, "OT(a, b)")
         if self.potentials:
             result = (f.view(parsed.a_view_shape), g.view(parsed.b_view_shape))
         else:
             result = (a * f).sum() + (b * g).sum()
             if self.debias:
-                fx, gx, _ = solve(x, x, a, a)
-                fy, gy, _ = solve(y, y, b, b)
+                fx, gx, _ = solve(x, x, a, a, "OT(a, a)")
+                fy, gy, _ = solve(y, y, b, b, "OT(b, b)")
                 result = result - 0.5 * ((a * fx).sum() + (a * gx).sum()) - 0.5 * ((b * fy).sum() + (b * gy).sum())
         if not_accepted:
+            stops = "; ".join(f"{name} stopped as {info.stop} and returned {info.returned}@{info.returned_step}"
+                              for name, info in not_accepted)
+            hint = ""
+            if any(info.stop == "too large" for _, info in not_accepted):
+                hint += (' A "too large" stop means a mask or an update exceeded the int32 indices or the '
+                         "device memory; a larger tol or fewer points make the masks smaller.")
+            if any(info.stop == "budget" for _, info in not_accepted):
+                hint += (' A "budget" stop means the fine updates reached their work budget before a check '
+                         "confirmed tol.")
             warnings.warn(f'backend="multiscale": the sampled check did not confirm tol={self.tol:g} in '
-                          f"{len(not_accepted)} solve(s) before the fine stage stalled, became unstable "
-                          "or reached its ceiling.",
-                          RuntimeWarning, stacklevel=3)
+                          f"{len(not_accepted)} solve(s): {stops}. The best candidate was returned unconfirmed "
+                          f"(info.detail says why each stopped).{hint}", RuntimeWarning, stacklevel=3)
         return result
 
     def forward(

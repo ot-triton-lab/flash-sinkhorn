@@ -4,8 +4,8 @@
 points and returns them as soon as a sampled check finds the marginal residual
 ``max(||P1 - a||_1, ||P^T 1 - b||_1)`` below ``tol``, for the full squared-Euclidean
 cost with ``P_ij = a_i b_j exp((f_i + g_j - C_ij)/eps)``. If the fine stage stalls,
-becomes unstable or reaches its ceiling before a check passes, it returns the candidate
-with the best stage-one score and reports ``accepted=False``. The coordinates must already be centered and TF32-rounded
+becomes unstable, reaches its ceiling or its work budget, or needs a mask too large to hold before a check passes, it
+returns the candidate with the best stage-one score and reports ``accepted=False``. The coordinates must already be centered and TF32-rounded
 by :func:`preprocess_coordinates` (the rounding is checked, the centering is not).
 """
 
@@ -17,13 +17,16 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from . import check as C
 from .coarse import (CONTINUATION_BATCH, CONTINUATION_MAX_UPDATES, CONTINUATION_MIN_PROGRESS,
                      CONTINUATION_SLOW_CHECKS, coarse_state, coarse_updates, continue_coarse, lift)
-from .fine import MASK_TOL_DIVISOR, FineState, UnstableMask, fine_step, mask_delta_rel, physical_pair, warm_state
-from .geometry import (annealing_schedule, block_summaries, build_cells, choose_block_size,
-                       choose_cell_level, execution_geometry, joint_sort, prefix_counts)
+from .fine import (MASK_TOL_DIVISOR, FineState, MaskTooLarge, UnstableMask, WorkBudget, fine_step, mask_delta_rel,
+                   physical_pair, warm_state)
+from .sparse_step import REPAIR_QUERY_CHUNK, dense_lse_rows
+from .geometry import (INT32_OFFSET_LIMIT, PAD_K, annealing_schedule, block_summaries, build_cells,
+                       choose_block_size, choose_cell_level, execution_geometry, joint_sort, prefix_counts)
 from ._preprocess import TF32_DROPPED_BITS, round_to_tf32
 
 # The fine stage stops by the coarse continuation's own stall rule, applied to the stage-one score.
@@ -33,13 +36,16 @@ FINE_SLOW_WINDOWS = CONTINUATION_SLOW_CHECKS    # three slow windows in a row st
 FINE_CEILING = CONTINUATION_MAX_UPDATES         # which never runs more than 2048 updates.
 FIXED_PREVIEW = 128  # an unaveraged candidate is always tried at update 128, whatever its score
 UNSTABLE_NONFINITE_CHECKS = 2  # two fine-stage checks in a row without a finite score stop it as unstable,
-                               # as does a mask with too many empty block rows (fine.EMPTY_ROW_LIMIT)
+                               # as does a mask whose empty block rows cost too much to repair (fine.REPAIR_COST_RATIO)
+WORK_PER_POINT = 4e8  # the fine stage's estimated work is at most 4e8 point pairs per point, over (n + m)/2 points
 
 # Check scheduling.
 CHECK_INTERVALS = (1, 2, 4, 8, 16)
 CHECK_WORK_FRACTION = 0.1       # a check may cost at most this share of the updates between checks
 NEAR_TARGET_FACTOR = 2.0        # check every update once the stage-one score is within 2 tol
 MILESTONE = 16                  # a check (and, near the target, a terminal preview) every 16 updates
+MAX_POINTS = INT32_OFFSET_LIMIT // PAD_K  # per side: offsets up to 16 * rows - 1 into the padded coordinates
+FP32_MAX = torch.finfo(torch.float32).max
 # The weights may miss a sum of one by at most min(1e-3, tol / MASK_TOL_DIVISOR): the mass defect
 # takes no larger share of the residual budget than the mask omission does.
 WEIGHT_SUM_TOLERANCE = 1e-3
@@ -49,7 +55,9 @@ WEIGHT_SUM_TOLERANCE = 1e-3
 class MultiscaleInfo:
     """What the solve did. ``returned`` is ``"lift"``, ``"ordinary"`` or ``"terminal"`` (an
     unaveraged preview), at fine update ``returned_step``; ``stop`` is ``"accepted"``, or why the
-    fine stage ended without acceptance, ``"stalled"``, ``"unstable"`` or ``"ceiling"``."""
+    fine stage ended without acceptance, ``"stalled"``, ``"unstable"``, ``"ceiling"``, ``"budget"`` (its
+    next update would exceed WORK_PER_POINT point pairs per point) or ``"too large"`` (a mask or an update
+    would exceed the int32 indices or the device memory)."""
     accepted: bool
     stop: str
     B: int
@@ -63,6 +71,8 @@ class MultiscaleInfo:
     returned_step: int
     checks: List[dict] = field(default_factory=list)
     tiles: List[Tuple[int, int, int]] = field(default_factory=list)  # (update, candidate, admitted); sparse updates only
+    detail: str = ""  # why the fine stage stopped, when it stopped without acceptance
+    fine_work: int = 0  # point pairs charged to the budget: refinement, half-steps and repairs of completed updates
 
 
 def _sync(device: torch.device) -> None:
@@ -125,14 +135,45 @@ def _autotune_entries() -> int:
     return len(tuner.cache)
 
 
+@torch.no_grad()
+def _transform_zero_weights(geo: dict, a: torch.Tensor, b: torch.Tensor, pair, eps: float):
+    """The pair with every zero-weight point's potential replaced by its dense c-transform against the other
+    side: the fine updates hold such points (they carry no mass), so their values are set once, here."""
+    f, g = pair
+    out = []
+    for pot, w, src, tgt, other, tgt_shift, lw, src_shift, src_inv, tgt_perm in (
+            (f, a, geo["x_s"], geo["y_s"], g, geo["beta"], geo["log_b"], geo["alpha"], geo["inv_perm_x"], geo["perm_y"]),
+            (g, b, geo["y_s"], geo["x_s"], f, geo["alpha"], geo["log_a"], geo["beta"], geo["inv_perm_y"], geo["perm_x"])):
+        zero = torch.nonzero(w == 0).flatten()
+        if zero.numel() == 0:
+            out.append(pot)
+            continue
+        other_hat = F.pad(other.float()[tgt_perm], (0, len(tgt) - len(other))) - tgt_shift
+        pot = pot.clone()
+        for first in range(0, len(zero), REPAIR_QUERY_CHUNK):
+            chunk = zero[first:first + REPAIR_QUERY_CHUNK]
+            rows = src_inv[chunk]                          # sorted positions of these zero-weight points
+            pot[chunk] = dense_lse_rows(src[rows].contiguous(), tgt, other_hat, lw, eps, 1.0) + src_shift[rows]
+        out.append(pot)
+    return out[0], out[1]
+
+
 def _validate(x, y, a, b, tol: float):
     for name, t in (("x", x), ("y", y), ("a", a), ("b", b)):
         if not isinstance(t, torch.Tensor) or t.device.type != "cuda":
             raise ValueError(f"{name} must be a CUDA tensor")
     if x.ndim != 2 or y.ndim != 2 or x.shape[1] != 3 or y.shape[1] != 3 or not len(x) or not len(y):
         raise ValueError("the multiscale solver needs nonempty three-dimensional point clouds")
+    if max(len(x), len(y)) > MAX_POINTS:
+        raise ValueError(f"the multiscale solver takes at most {MAX_POINTS:,} points per side (int32 offsets of the "
+                         f"padded coordinates); got {len(x):,} and {len(y):,}")
+    if y.device != x.device:
+        raise ValueError("x and y must be on the same device")
     if a.shape != (len(x),) or b.shape != (len(y),) or a.device != x.device or b.device != x.device:
         raise ValueError("a and b must be 1-D weights matching x and y, on the same device")
+    for name, t in (("x", x), ("y", y), ("a", a), ("b", b)):
+        if not bool(torch.isfinite(t).all()):
+            raise ValueError(f"{name} must be finite")
     limit = min(WEIGHT_SUM_TOLERANCE, tol / MASK_TOL_DIVISOR)
     for name, w in (("a", a), ("b", b)):
         total = float(w.double().sum())
@@ -157,22 +198,32 @@ def solve_multiscale(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch
     device = x.device
     n, m = len(x), len(y)
     x, y, a, b = x.float().contiguous(), y.float().contiguous(), a.float().contiguous(), b.float().contiguous()
+    for name, t in (("x", x), ("y", y), ("a", a), ("b", b)):
+        if not bool(torch.isfinite(t).all()):
+            raise ValueError(f"{name} is not finite in fp32")
 
     # Geometry, block size, cell level, schedule.
     l2 = int(torch.cuda.get_device_properties(device).L2_cache_size)
     joint = joint_sort(x, y, a, b)
+    reach = joint.extent ** 2  # bounds every cost, and every squared norm of the centered clouds
+    if not max(reach, reach / eps, 1.0 / eps) < FP32_MAX:
+        raise ValueError(f"eps={eps:g} and a cloud of extent {joint.extent:g} overflow fp32 potentials")
     sx, sy = block_summaries(joint.source), block_summaries(joint.target)
     B = choose_block_size(joint, sx, sy, l2)
     t = choose_cell_level(prefix_counts(joint.source), prefix_counts(joint.target), n, m, B, l2, joint.sides, eps)
     prefix, tail = annealing_schedule(joint.extent, eps)
     cells_x, cells_y = build_cells(joint.source, t, round_to_tf32), build_cells(joint.target, t, round_to_tf32)
     geo = execution_geometry(joint, B, sx, sy)
+    delta_rel = mask_delta_rel(geo, tol)
+    if not delta_rel > 0:
+        raise ValueError(f"tol={tol:g} is too small for {max(geo['N_B'], geo['M_B']):,} blocks: the per-block "
+                         "omission budget underflows")
 
     check = C.SampledCheck(x, y, a, b, eps, tol)
     records: List[dict] = []
     tiles: List[Tuple[int, int, int]] = []
     best: Optional[tuple] = None  # (rank, pair, kind, step)
-    counts = dict(continuation=0, fine=0, previews=0)
+    counts = dict(continuation=0, fine=0, previews=0, work=0)
 
     def evaluate(kind: str, step: int, pair_fn: Callable):
         nonlocal best
@@ -188,8 +239,10 @@ def solve_multiscale(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch
             best = (entry["rank"], pair, kind, step)
         return pair, entry
 
-    def finish(pair, *, accepted: bool, kind: str, step: int, stop: str = "accepted"):
-        info = MultiscaleInfo(accepted=accepted, stop=stop, B=B, t=t, coarse_cells=(len(cells_x.mass), len(cells_y.mass)),
+    def finish(pair, *, accepted: bool, kind: str, step: int, stop: str = "accepted", detail: str = ""):
+        pair = _transform_zero_weights(geo, a, b, pair, eps)  # a lift's too: it transformed them against the cells
+        info = MultiscaleInfo(accepted=accepted, stop=stop, detail=detail, fine_work=counts["work"], B=B, t=t,
+                              coarse_cells=(len(cells_x.mass), len(cells_y.mass)),
                               schedule_entries=len(prefix) + len(tail),
                               continuation_updates=counts["continuation"], fine_updates=counts["fine"],
                               terminal_previews=counts["previews"], returned=kind, returned_step=step,
@@ -222,7 +275,6 @@ def solve_multiscale(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch
     last = entry
 
     # Block-sparse fine updates from the last lift.
-    delta_rel = mask_delta_rel(geo, tol)
     fs: FineState = warm_state(geo, *fine_pair)
 
     nonfinite = 0  # fine-stage checks in a row without a finite score
@@ -233,28 +285,37 @@ def solve_multiscale(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch
         nonfinite = nonfinite + 1 if entry["rank"] is None else 0
         return pair, entry
 
+    budget = WORK_PER_POINT * (n + m) / 2
+
+    def charge(before: FineState, after: FineState):
+        counts["work"] += after.work - before.work
+
     def preview(step: int):
-        terminal, _ = fine_step(geo, fs, eps, delta_rel, alpha=1.0)
+        terminal, _ = fine_step(geo, fs, eps, delta_rel, alpha=1.0, work_left=budget - counts["work"])
         counts["previews"] += 1
+        charge(fs, terminal)
         return fine_check("terminal", step, lambda: physical_pair(geo, terminal))
 
     def advance(state: FineState, count: int) -> FineState:
         for _ in range(count):
-            state, sizes = fine_step(geo, state, eps, delta_rel, alpha=0.5)
+            before = state
+            state, sizes = fine_step(geo, state, eps, delta_rel, alpha=0.5, work_left=budget - counts["work"])
             counts["fine"] = state.ordinary_steps
             if sizes is not None:
                 tiles.append((state.ordinary_steps, *sizes))
+            charge(before, state)
         return state
 
-    stop = "ceiling"
+    stop, detail = "ceiling", f"{FINE_CEILING} fine updates without confirmation"
+    found = None  # (pair, kind, step) of the accepted candidate, returned outside the handlers below
     try:
         if committed:
             pair, entry = preview(0)
             if entry["accepted"]:
-                return finish(pair, accepted=True, kind="terminal", step=0)
+                found = (pair, "terminal", 0)
         h, step_seconds, cold = 0, None, False
         window_score, slow = None, 0
-        while h < FINE_CEILING:
+        while found is None and h < FINE_CEILING:
             target = _next_check(h, FINE_CEILING, _interval(last["seconds"], step_seconds, last, tol, cold))
             before = _autotune_entries()
             seconds, fs = _timed(device, lambda: advance(fs, target - h))
@@ -262,9 +323,10 @@ def solve_multiscale(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch
             h = target
             pair, last = fine_check("ordinary", h, lambda: physical_pair(geo, fs))
             if last["accepted"]:
-                return finish(pair, accepted=True, kind="ordinary", step=h)
+                found = (pair, "ordinary", h)
+                break
             if nonfinite >= UNSTABLE_NONFINITE_CHECKS:
-                stop = "unstable"
+                stop, detail = "unstable", f"{UNSTABLE_NONFINITE_CHECKS} checks in a row gave no finite score"
                 break
             stalled = False
             if h % FINE_WINDOW == 0:
@@ -274,16 +336,27 @@ def solve_multiscale(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch
             if _preview_due(h, FINE_CEILING, last, tol) or stalled:
                 pair, entry = preview(h)
                 if entry["accepted"]:
-                    return finish(pair, accepted=True, kind="terminal", step=h)
+                    found = (pair, "terminal", h)
+                    break
                 if nonfinite >= UNSTABLE_NONFINITE_CHECKS:
-                    stop = "unstable"
+                    stop, detail = "unstable", f"{UNSTABLE_NONFINITE_CHECKS} checks in a row gave no finite score"
                     break
             if stalled:
                 stop = "stalled"
+                detail = (f"the sampled score improved by less than {FINE_MIN_PROGRESS:.0%} over "
+                          f"{FINE_SLOW_WINDOWS} windows of {FINE_WINDOW} updates")
                 break
-    except UnstableMask:
-        stop = "unstable"
+    except UnstableMask as ex:
+        stop, detail = "unstable", str(ex)
+    except MaskTooLarge as ex:
+        stop, detail = "too large", str(ex)
+    except WorkBudget as ex:
+        stop, detail = "budget", f"{ex} (budget {WORK_PER_POINT:.0e} pairs per point)"
+    except torch.cuda.OutOfMemoryError as ex:           # a check or a preview's workspace, not the mask
+        stop, detail = "too large", "out of device memory in the fine stage: " + str(ex).split("\n")[0][:200]
 
+    if found is not None:
+        return finish(found[0], accepted=True, kind=found[1], step=found[2])
     if best is not None:
-        return finish(best[1], accepted=False, kind=best[2], step=best[3], stop=stop)
-    return finish(tail_pair, accepted=False, kind="lift", step=0, stop=stop)
+        return finish(best[1], accepted=False, kind=best[2], step=best[3], stop=stop, detail=detail)
+    return finish(tail_pair, accepted=False, kind="lift", step=0, stop=stop, detail=detail)
