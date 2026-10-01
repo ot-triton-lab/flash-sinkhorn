@@ -15,6 +15,7 @@ FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**neve
 
 ## News
 
+- **2026-10** Released [v0.4.0](https://github.com/ot-triton-lab/flash-sinkhorn/releases/tag/v0.4.0): a multiscale backend for large 3-D point clouds (`SamplesLoss(backend="multiscale", tol=...)`).
 - **2026-05** 🎉 FlashSinkhorn accepted to **ICML 2026 as an Oral** (top 0.7%, 168 of ~24k submissions).
 - **2026-04** Released [v0.3.3](https://github.com/ot-triton-lab/flash-sinkhorn/releases/tag/v0.3.3).
 - **2026-02** FlashSinkhorn (v0.3.0) released; preprint on [arXiv](https://arxiv.org/abs/2602.03067).
@@ -32,7 +33,7 @@ FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**neve
 - **Unbalanced/semi-unbalanced OT** via `reach` parameter
 - **Large-D support** (d > 1024) with tiled gradient kernel
 - **Early stopping** with convergence threshold
-- **Multiscale backend** (`SamplesLoss(backend="multiscale", tol=...)`) for balanced, forward-only OT on large 3-D point clouds: Sinkhorn on Morton cells, then block-sparse fine updates until a sampled marginal check confirms `tol` (otherwise it warns and returns its best candidate); see [API.md](API.md) for its options and measured limits
+- **Multiscale backend** (`SamplesLoss(backend="multiscale", tol=...)`) for balanced, forward-only OT on large 3-D point clouds: Sinkhorn on Morton cells, then block-sparse fine updates as needed, until an empirical sampled marginal check passes `tol` (otherwise it warns and returns its best candidate); see [API.md](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/API.md#multiscale-backend-large-3-d-point-clouds) for its options and measured limits
 
 ## Install
 
@@ -143,6 +144,24 @@ grad_x = torch.autograd.grad(cost, x, create_graph=True)[0]
 hvp = torch.autograd.grad((grad_x * v).sum(), x)[0]
 ```
 
+### Large 3-D Point Clouds (Multiscale Backend)
+
+For balanced OT between large three-dimensional point clouds (forward only):
+
+```python
+x = torch.rand(2**20, 3, device="cuda")   # (n, 3) point clouds
+y = torch.rand(2**20, 3, device="cuda")
+
+loss = SamplesLoss(loss="sinkhorn", blur=0.05, backend="multiscale", tol=5e-3)
+cost = loss(x, y)
+info = loss.last_multiscale_info   # info.accepted, info.stop, info.detail
+```
+
+The solve returns once an empirical sampled check finds the marginal residual below `tol`
+(a stopping rule, not a bound); otherwise it warns and returns its best candidate with
+`info.accepted == False`.
+See [API.md](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/API.md#multiscale-backend-large-3-d-point-clouds) for its options and measured limits.
+
 ## FlashSinkhorn (v0.3.0)
 
 FlashSinkhorn is a reformulated Sinkhorn kernel that uses **shifted potentials** inspired by FlashAttention. It reduces bias vector loads by 67% and elementwise operations by 78% per tile, and improves scalability on OT-based downstream tasks.
@@ -194,7 +213,7 @@ SamplesLoss(
     loss="sinkhorn",
     p=2,                      # Only p=2 supported (squared Euclidean)
     blur=0.05,                # Regularization: eps = blur^2
-    debias=True,              # Debiased Sinkhorn divergence
+    debias=False,             # True: debiased Sinkhorn divergence
     half_cost=False,          # Use ||x-y||²/2 to match GeomLoss
     reach=None,               # Unbalanced OT (None = balanced)
     reach_x=None,             # Semi-unbalanced: source marginal
@@ -203,8 +222,13 @@ SamplesLoss(
     n_iters=None,             # Max iterations (None = use scaling)
     threshold=None,           # Early stopping threshold
     inner_iterations=10,      # Check convergence every N iters
+    backend="symmetric",      # "symmetric", "alternating" or "multiscale"
+    tol=None,                 # Multiscale only: target marginal residual (default 5e-3)
 )
 ```
+
+With `backend="multiscale"`, `n_iters` and `threshold` are rejected and `scaling` and `inner_iterations` do not
+apply; `tol` sets the stopping point. `backend="alternating"` requires `use_epsilon_scaling=False`, `eps` and `n_iters`.
 
 ### Low-Level API
 
@@ -225,6 +249,9 @@ from flash_sinkhorn.kernels.sinkhorn_triton_grad_sqeuclid import (
     sinkhorn_geomloss_online_grad_sqeuclid,
 )
 from flash_sinkhorn.hvp import hvp_x_sqeuclid_from_potentials
+
+# Multiscale backend (large 3-D point clouds)
+from flash_sinkhorn.multiscale import preprocess_coordinates, check_limits, solve_multiscale
 ```
 
 ### C-Transform / Semi-Dual OT
@@ -277,7 +304,7 @@ FlashSinkhorn streams tiles of (x,y) and computes costs on-the-fly:
 
 - Uses `exp2/log2` for stable LSE computation
 - Safe log/division guards against underflow
-- TF32 enabled by default for ~2x speedup on A100/H100 (set `allow_tf32=False` for strict FP32)
+- TF32 enabled by default for ~2x speedup on A100/H100 (set `allow_tf32=False` for strict FP32; the multiscale backend rejects it)
 - HVP (double backward) uses strict FP32 internally for numerical stability
 
 ## Benchmarks
