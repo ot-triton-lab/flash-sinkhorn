@@ -145,7 +145,7 @@ def test_flashstyle_symmetric_eps_scaling_matches_ref():
 def test_flashstyle_symmetric_matches_geomloss_tensorized():
     """Test FlashSinkhorn matches GeomLoss tensorized backend."""
     geomloss = pytest.importorskip("geomloss")
-    from geomloss.sinkhorn_samples import sinkhorn_tensorized
+    from geomloss._legacy.sinkhorn_samples import sinkhorn_tensorized
 
     device = torch.device("cuda")
     n, m, d = 64, 48, 32

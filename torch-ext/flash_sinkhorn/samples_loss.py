@@ -23,6 +23,8 @@ from .kernels.sinkhorn_flashstyle_sqeuclid import (
     sinkhorn_flashstyle_symmetric,
 )
 
+#: Default target marginal residual of backend="multiscale".
+MULTISCALE_DEFAULT_TOL = 5e-3
 
 # ---------------------------------------------------------------------------
 # Input parsing helpers
@@ -254,13 +256,20 @@ class SamplesLoss(torch.nn.Module):
     - Only squared Euclidean ground cost is supported (with optional label cost).
     - Supports balanced, unbalanced, and semi-unbalanced OT.
 
-    Two iteration strategies are available (both use FlashSinkhorn kernels):
+    Three solvers are available (all use FlashSinkhorn kernels):
     - `backend="symmetric"` (default): Symmetric Sinkhorn (Jacobi-style updates).
       Supports all features: debiasing, unbalanced OT, epsilon scaling, label cost.
     - `backend="alternating"`: Alternating Sinkhorn (Gauss-Seidel-style updates).
       Requires fixed eps and n_iters.
       Supports: debiasing, unbalanced/semi-unbalanced OT.
       Does NOT support: epsilon scaling or label cost.
+    - `backend="multiscale"`: for large three-dimensional point clouds. Solves on
+      Morton-cell centroids, lifts to the points and finishes with block-sparse
+      updates, returning once a sampled check finds the marginal residual
+      max(||P1 - a||_1, ||P^T 1 - b||_1) below `tol` (default 5e-3). It solves the
+      centered, TF32-rounded clouds at eps = blur**2 with its own annealing schedule.
+      Supports: balanced OT, debiasing, half_cost, potentials. Forward only (no
+      gradients); no unbalanced OT, label cost or batched inputs.
 
     The implementation returns either:
     - a scalar OT cost (default), or
@@ -355,6 +364,8 @@ class SamplesLoss(torch.nn.Module):
         use_flashstyle: Optional[bool] = None,
         # Adaptive padding for variable-size OT
         pad_to_multiple: Optional[int] = None,
+        # Target marginal residual of backend="multiscale"
+        tol: Optional[float] = None,
     ):
         super().__init__()
 
@@ -369,9 +380,9 @@ class SamplesLoss(torch.nn.Module):
             raise ValueError('Only loss="sinkhorn" is supported.')
         if p != 2:
             raise ValueError("Only p=2 (squared Euclidean cost) is supported.")
-        if backend not in ("symmetric", "alternating", "triton", "auto"):
+        if backend not in ("symmetric", "alternating", "multiscale", "triton", "auto"):
             raise ValueError(
-                'Only backend in {"symmetric","alternating","triton","auto"} is supported.'
+                'Only backend in {"symmetric","alternating","multiscale","triton","auto"} is supported.'
             )
         # Normalize legacy aliases to canonical names
         if backend in ("triton", "auto"):
@@ -397,6 +408,22 @@ class SamplesLoss(torch.nn.Module):
                     'backend="alternating" does not support OTDD label cost. '
                     'Use backend="symmetric" for label-augmented cost.'
                 )
+        if backend == "multiscale":
+            unsupported = dict(reach=reach, reach_x=reach_x, reach_y=reach_y,
+                               label_cost_matrix=label_cost_matrix, threshold=threshold, eps=eps,
+                               eps_list=eps_list, n_iters=n_iters, diameter=diameter,
+                               pad_to_multiple=pad_to_multiple)
+            given = [name for name, value in unsupported.items() if value is not None]
+            given += [name for name, value in (("allow_tf32=False", allow_tf32),
+                                               ("use_epsilon_scaling=False", use_epsilon_scaling))
+                      if not value]
+            if given:
+                raise ValueError(f'backend="multiscale" does not support {", ".join(given)}.')
+            tol = MULTISCALE_DEFAULT_TOL if tol is None else float(tol)
+            if not 0.0 < tol <= 1.0:
+                raise ValueError("tol must be in (0, 1].")
+        elif tol is not None:
+            raise ValueError('tol applies only to backend="multiscale".')
         if reach is not None and reach <= 0:
             raise ValueError("reach must be positive (or None for balanced OT).")
         if reach_x is not None and reach_x <= 0:
@@ -428,6 +455,9 @@ class SamplesLoss(torch.nn.Module):
         self.debias = bool(debias)
         self.potentials = bool(potentials)
         self.backend = backend
+        self.tol = tol
+        #: MultiscaleInfo of the last backend="multiscale" solve of OT(a, b), or None.
+        self.last_multiscale_info = None
         self.normalize = bool(normalize)
 
         self.use_epsilon_scaling = bool(use_epsilon_scaling)
@@ -530,6 +560,58 @@ class SamplesLoss(torch.nn.Module):
             raise ValueError("eps_list is empty after applying n_iters.")
         return eps_list
 
+    def _forward_multiscale(self, parsed, label_x=None, label_y=None):
+        """Cost or potentials from the multiscale solver (forward only).
+
+        The solver runs on the centered, TF32-rounded coordinates, for the target
+        ``eps = blur**2``, until its sampled check finds the marginal residual below
+        ``tol`` or it stops unconfirmed and warns; it uses its own annealing schedule,
+        so ``scaling`` is not used. With ``debias=True`` each of the three problems is
+        checked against ``tol`` separately.
+        """
+        from .multiscale import solve_multiscale
+        from .multiscale._preprocess import preprocess_coordinates
+
+        if parsed.batched:
+            raise ValueError('backend="multiscale" does not support batched inputs.')
+        if label_x is not None or label_y is not None:
+            raise ValueError('backend="multiscale" does not support label costs.')
+        if parsed.x.shape[-1] != 3 or parsed.y.shape[-1] != 3:
+            raise ValueError('backend="multiscale" supports three-dimensional point clouds.')
+        if not self.potentials and any(t.requires_grad for t in (parsed.x, parsed.y, parsed.a, parsed.b)):
+            raise NotImplementedError('backend="multiscale" does not support gradients.')
+        # The solver uses the full cost ||x - y||^2; a scaled cost s * ||x - y||^2 at eps is the
+        # full-cost problem at eps / s, with potentials scaled by s.
+        s = self.cost_scale
+        eps = self.blur ** 2 / s
+        not_accepted = []
+
+        def solve(x, y, a, b, name):
+            f, g, info = solve_multiscale(x, y, a, b, eps, self.tol)
+            if not info.accepted:
+                not_accepted.append((name, info))
+            return s * f, s * g, info
+
+        a, b = parsed.a.detach().float().contiguous(), parsed.b.detach().float().contiguous()
+        x, y = preprocess_coordinates(parsed.x, parsed.y, a, b)
+        f, g, self.last_multiscale_info = solve(x, y, a, b, "OT(a, b)")
+        if self.potentials:
+            result = (f.view(parsed.a_view_shape), g.view(parsed.b_view_shape))
+        else:
+            result = (a * f).sum() + (b * g).sum()
+            if self.debias:
+                fx, gx, _ = solve(x, x, a, a, "OT(a, a)")
+                fy, gy, _ = solve(y, y, b, b, "OT(b, b)")
+                result = result - 0.5 * ((a * fx).sum() + (a * gx).sum()) - 0.5 * ((b * fy).sum() + (b * gy).sum())
+        if not_accepted:
+            stops = "; ".join(f"{name} stopped as {info.stop} and returned {info.returned}@{info.returned_step} "
+                              f"({info.detail})" for name, info in not_accepted)
+            warnings.warn(f'backend="multiscale": the sampled check did not confirm tol={self.tol:g} in '
+                          f"{len(not_accepted)} solve(s): {stops}. The best candidate was returned unconfirmed; "
+                          "the API documentation's Limits say how to read these numbers.",
+                          RuntimeWarning, stacklevel=3)
+        return result
+
     def forward(
         self,
         *args: Union[torch.Tensor, float],
@@ -540,6 +622,9 @@ class SamplesLoss(torch.nn.Module):
 
         if not parsed.x.is_cuda or not parsed.y.is_cuda:
             raise ValueError("flash_sinkhorn.SamplesLoss requires CUDA tensors.")
+
+        if self.backend == "multiscale":
+            return self._forward_multiscale(parsed, label_x, label_y)
 
         config = self._make_config()
 

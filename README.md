@@ -11,7 +11,7 @@
 
 **Streaming Entropic Optimal Transport in PyTorch + Triton**
 
-FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**never materializing the n×m cost matrix**—enabling **O(nd) memory** instead of O(n²).
+FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**never materializing the n×m cost matrix**—enabling **O(nd) memory** instead of O(n²); the multiscale backend also stores its block masks.
 
 ## News
 
@@ -32,6 +32,7 @@ FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**neve
 - **Unbalanced/semi-unbalanced OT** via `reach` parameter
 - **Large-D support** (d > 1024) with tiled gradient kernel
 - **Early stopping** with convergence threshold
+- **Multiscale backend** (`SamplesLoss(backend="multiscale", tol=...)`) for balanced, forward-only OT on large 3-D point clouds: Sinkhorn on Morton cells, then block-sparse fine updates until a sampled marginal check confirms `tol` (otherwise it warns and returns its best candidate); see [API.md](API.md) for its options and measured limits
 
 ## Install
 
@@ -268,7 +269,7 @@ Differentiable w.r.t. `x` and `psi` (not `y`). Use `cost_scale=0.5` for the
 ### Memory Efficiency
 
 FlashSinkhorn streams tiles of (x,y) and computes costs on-the-fly:
-- **Forward**: O(nd) memory (no n×m cost matrix)
+- **Forward**: O(nd) memory (no n×m cost matrix); the multiscale backend also stores its block masks
 - **Gradient**: O(nd) memory (streaming accumulation)
 - **HVP**: O(nd) memory (CG solver with streaming matvec)
 

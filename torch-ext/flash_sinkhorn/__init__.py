@@ -1,7 +1,8 @@
 """FlashSinkhorn: Streaming Entropic Optimal Transport in PyTorch + Triton.
 
 FlashSinkhorn uses FlashAttention-style streaming to compute Sinkhorn OT
-without materializing the n×m cost matrix, enabling O(nd) memory usage.
+without materializing the n×m cost matrix, enabling O(nd) memory usage; the
+multiscale backend also stores its block masks.
 
 Package name: flash_sinkhorn
 """
@@ -38,4 +39,4 @@ __all__ = [
     "c_transform_cost",
     "__version__",
 ]
-__version__ = "0.3.3.post1"
+__version__ = "0.4.0"

@@ -5,7 +5,7 @@ from flash_sinkhorn.kernels.sinkhorn_triton_ott_sqeuclid import apply_lse_kernel
 
 
 geomloss = pytest.importorskip("geomloss")
-from geomloss.sinkhorn_samples import softmin_tensorized  # noqa: E402
+from geomloss._legacy.sinkhorn_samples import softmin_tensorized  # noqa: E402
 
 
 def _sqeuclid_cost(x, y):

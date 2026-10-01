@@ -8,7 +8,7 @@ import torch
 # Skip all tests if geomloss is not available
 geomloss = pytest.importorskip("geomloss")
 
-from geomloss.sinkhorn_samples import sinkhorn_tensorized
+from geomloss._legacy.sinkhorn_samples import sinkhorn_tensorized
 
 from flash_sinkhorn import SamplesLoss
 from flash_sinkhorn.kernels._common import max_diameter
@@ -222,7 +222,7 @@ class TestDampeningBehavior:
 
     def test_damping_matches_geomloss(self):
         """Verify our dampening function matches GeomLoss."""
-        from geomloss.sinkhorn_divergence import dampening as geomloss_dampening
+        from geomloss._legacy.sinkhorn_divergence import dampening as geomloss_dampening
         from flash_sinkhorn.kernels._common import dampening
 
         test_cases = [
