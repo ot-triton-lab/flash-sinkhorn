@@ -29,7 +29,7 @@ FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**neve
 - **Analytic gradients** (no backprop through Sinkhorn iterations)
 - **Hessian-vector products** via streaming CG solver
 - **C-transform / semi-dual OT** — streaming hard-argmin Kantorovich c-transform with analytic Danskin gradients, for WPP and other semi-dual methods (`c_transform_fwd`, `c_transform_cost`)
-- **Half-cost support** (`half_cost=True`) for exact GeomLoss parity
+- **Half-cost support** (`half_cost=True`) to match GeomLoss's squared-Euclidean cost convention
 - **Unbalanced/semi-unbalanced OT** via `reach` parameter
 - **Large-D support** (d > 1024) with tiled gradient kernel
 - **Early stopping** with convergence threshold
@@ -82,16 +82,16 @@ grad_x = torch.autograd.grad(cost, x)[0]  # Analytic gradient
 Use `half_cost=True` to match GeomLoss's cost convention:
 
 ```python
-# FlashSinkhorn with half_cost matches GeomLoss exactly
+# FlashSinkhorn with GeomLoss's squared-Euclidean cost convention
 flash_loss = SamplesLoss(loss="sinkhorn", blur=0.1, half_cost=True, debias=True)
 
 # Equivalent GeomLoss call
-# geomloss_loss = geomloss.SamplesLoss(loss="sinkhorn", p=2, blur=0.1, debias="positive")
+# geomloss_loss = geomloss.SamplesLoss(loss="sinkhorn", p=2, blur=0.1, debias=True)
 ```
 
 ### Unbalanced OT
 
-For distributions with different total mass or outliers:
+For matching with relaxed marginals:
 
 ```python
 loss = SamplesLoss(
@@ -121,6 +121,8 @@ loss = SamplesLoss(
 loss = SamplesLoss(
     loss="sinkhorn",
     blur=0.1,
+    use_epsilon_scaling=False,
+    eps=0.01,
     n_iters=100,
     threshold=1e-3,       # Stop when potential change < threshold
     inner_iterations=10,  # Check every N iterations
@@ -302,9 +304,9 @@ FlashSinkhorn streams tiles of (x,y) and computes costs on-the-fly:
 
 ### Numerical Stability
 
-- Uses `exp2/log2` for stable LSE computation
+- Online log-sum-exp with a running maximum, in exp2/log2
 - Safe log/division guards against underflow
-- TF32 enabled by default for ~2x speedup on A100/H100 (set `allow_tf32=False` for strict FP32; the multiscale backend rejects it)
+- TF32 enabled by default for the cost dot products (set `allow_tf32=False` for strict FP32; the multiscale backend rejects it)
 - HVP (double backward) uses strict FP32 internally for numerical stability
 
 ## Benchmarks

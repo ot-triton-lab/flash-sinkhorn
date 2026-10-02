@@ -8,7 +8,9 @@ This document describes the `SamplesLoss` API, which provides a GeomLoss-compati
 from flash_sinkhorn import SamplesLoss
 ```
 
-The main entry point for computing Sinkhorn distances and potentials. Drop-in compatible with GeomLoss's `SamplesLoss` for common use cases.
+The main entry point for computing Sinkhorn distances and potentials. Its calling interface follows GeomLoss's
+`SamplesLoss`, but the defaults differ (full cost `‖x−y‖²`, `debias=False`): match the cost, debiasing, weights and
+solver settings when comparing the two.
 
 ### Basic Usage
 
@@ -39,9 +41,9 @@ cost = loss(a, x, b, y)
 | `loss` | `str` | `"sinkhorn"` | Loss type. Only `"sinkhorn"` is supported. |
 | `p` | `int` | `2` | Cost exponent. Only `p=2` (squared Euclidean) is supported. |
 | `blur` | `float` | `0.05` | Blur parameter (epsilon = blur²). Controls regularization strength. |
-| `scaling` | `float` | `0.5` | Epsilon-scaling factor ∈ (0,1). Smaller = more iterations, better accuracy. |
-| `debias` | `bool` | `False` | Debiased Sinkhorn divergence. Computes S(x,y) - S(x,x)/2 - S(y,y)/2. |
-| `potentials` | `bool` | `False` | If `True`, return `(f, g)` potentials instead of cost. |
+| `scaling` | `float` | `0.5` | Epsilon-scaling factor ∈ (0,1). Closer to 1 = more annealing steps. At small `blur` the default 0.5 can leave the solve far from converged, as in GeomLoss; no value guarantees convergence. |
+| `debias` | `bool` | `False` | Debiased cost OT(x,y) - OT(x,x)/2 - OT(y,y)/2. The symmetric and alternating backends run the three problems on the schedule of OT(x,y), as GeomLoss does; the multiscale backend solves each on its own. With `reach_x != reach_y` it is not a divergence: it need not be symmetric, minimal at x = y, or nonnegative. |
+| `potentials` | `bool` | `False` | If `True`, return the potentials `(f, g)` of OT(x,y) instead of the cost, whatever `debias` says (GeomLoss subtracts the self potentials when `debias=True`). |
 | `normalize` | `bool` | `True` | Normalize weights to sum to 1. |
 
 #### Unbalanced / Semi-Unbalanced OT
@@ -66,6 +68,11 @@ Control marginal relaxation via `reach`, `reach_x`, and `reach_y` parameters. Th
 | `reach_x=None, reach_y=r` | Semi-unbalanced: strict source, relax target |
 | `reach_x=r1, reach_y=r2` | Asymmetric unbalanced: different relaxation per marginal |
 
+With probability weights, one common reach, the same cost and converged solves, values and potentials agree with
+GeomLoss. GeomLoss's coordinate gradients (checked with 0.3.1) are (rho + eps/2) / (rho + eps) times the OT
+gradient, because autograd never calls the backward its `UnbalancedWeight` defines; flash-sinkhorn's carry no such
+factor.
+
 #### Backend Selection
 
 | Parameter | Type | Default | Description |
@@ -76,18 +83,19 @@ Control marginal relaxation via `reach`, `reach_x`, and `reach_y` parameters. Th
 
 **Backend comparison:**
 
-| Backend | Iteration Style | Kernel Launches/Iter | Matches |
-|---------|-----------------|---------------------|---------|
-| `"symmetric"` (default) | Symmetric | 1 | GeomLoss |
+| Backend | Iteration Style | LSE kernel launches/iter | Matches |
+|---------|-----------------|--------------------------|---------|
+| `"symmetric"` (default) | Symmetric | 1 (fused), or 2 for large n | GeomLoss |
 | `"alternating"` | Alternating | 2 | OTT-JAX |
 
-> **Important**: These backends implement **mathematically different algorithms** that converge to **different potentials**. Use `backend="symmetric"` for GeomLoss comparisons and `backend="alternating"` for OTT-JAX comparisons.
+> **Important**: Both backends solve the same OT problem with different update orders. At convergence they give the same plan (balanced potentials up to an additive constant); unconverged iterates differ. Use `backend="symmetric"` for GeomLoss comparisons and `backend="alternating"` for OTT-JAX comparisons.
 
 **Alternating backend restrictions** (required for OTT-JAX parity):
 - `use_epsilon_scaling=False` (fixed epsilon only)
 - `eps` and `n_iters` must be specified
-- `debias=False` (debiased Sinkhorn not supported)
-- `reach`/`reach_x`/`reach_y` must be `None` (unbalanced not supported)
+- no label cost (`label_cost_matrix`)
+
+Debiasing and relaxed marginals are supported.
 
 #### Epsilon Scheduling
 
@@ -95,14 +103,15 @@ Control marginal relaxation via `reach`, `reach_x`, and `reach_y` parameters. Th
 |-----------|------|---------|-------------|
 | `use_epsilon_scaling` | `bool` | `True` | Use epsilon-scaling schedule (recommended). |
 | `eps` | `float` or `None` | `None` | Fixed epsilon (only if `use_epsilon_scaling=False`). |
-| `n_iters` | `int` or `None` | `None` | Number of iterations (only if `use_epsilon_scaling=False`). |
+| `n_iters` | `int` or `None` | `None` | Length of the fixed-`eps` schedule (`use_epsilon_scaling=False`). An automatic or explicit schedule is truncated to it, never extended. The symmetric backend adds an initialization and, if enabled, the final extrapolation; early stopping can end the run sooner. |
 | `diameter` | `float` or `None` | `None` | Point cloud diameter. Auto-computed if `None`. |
-| `eps_list` | `list[float]` or `None` | `None` | Custom epsilon schedule (overrides other epsilon params). |
-| `last_extrapolation` | `bool` | `True` | Final full-step extrapolation (GeomLoss convention). |
+| `eps_list` | `list[float]` or `None` | `None` | Custom epsilon schedule, replacing the automatic one (`n_iters` truncates it). The alternating backend runs at most as many iterations as the truncated list has entries, all at its last epsilon. |
+| `last_extrapolation` | `bool` | `True` | Final full-step extrapolation (GeomLoss convention); symmetric backend only. |
 
 #### Early Stopping (like OTT-JAX)
 
-> **New Feature**: Threshold-based early stopping for faster convergence (2-4x speedup).
+A potential-change threshold can stop the iterations early; the time it saves depends on the problem and on the
+cost of the checks.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -110,29 +119,39 @@ Control marginal relaxation via `reach`, `reach_x`, and `reach_y` parameters. Th
 | `inner_iterations` | `int` | `10` | Check convergence every N iterations. |
 
 **How it works:**
-- Tracks potential change: `max(|f_new - f_old|, |g_new - g_old|)` every `inner_iterations`
-- Stops when change < `threshold`
-- Uses cheap max-reduction (no extra kernel launch)
+- Tracks the potential change `max(|f_new - f_old|, |g_new - g_old|)` between checks every `inner_iterations`
+  updates, and stops when it falls below `threshold`
+- The symmetric backend checks only at the target epsilon and needs two checks there, so under epsilon scaling the
+  threshold acts only where the schedule repeats the target epsilon (`eps_list`); the alternating backend checks
+  from the start
+- Each check costs a max-reduction and a host synchronization
+- A threshold that is never met gives a `RuntimeWarning`. The change test is not a marginal-residual certificate.
+- `threshold=None` runs all iterations
 
-**Recommended values:**
-- `threshold=1e-3`: Good balance of speed (3-4x faster) and accuracy
-- `threshold=1e-6`: High precision with moderate speedup (2x faster)
-- `threshold=None`: Run all iterations (original behavior)
-- `inner_iterations=5`: Optimal check frequency (15% faster than default 10)
+Some problems stay unconverged at large iteration counts. On clustered 2-D clouds of 400 points at a fixed
+`eps=0.09` with `n_iters=50000`, the symmetric backend's `OT(a, b)` solve still had a marginal residual of 2.1e-4 and
+the debiased gradient was 1.7% off, against 0.07% for the alternating backend. Raising `n_iters` alone need not fix
+this.
 
 #### Numerical Precision
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `allow_tf32` | `bool` | `True` | Allow TF32 for matmuls. Set `False` for strict FP32. |
-| `use_exp2` | `bool` | `True` | Use exp2/log2 (FlashAttention-like, more stable). |
+| `allow_tf32` | `bool` | `True` | Allow TF32 for the dot products in the cost. Set `False` for strict FP32, for instance to compare with float64 or CPU references. The error of either setting depends on the geometry, `eps`, the conditioning and the iteration count. |
+| `use_exp2` | `bool` | `True` | Compute the log-sum-exp with exp2/log2, as FlashAttention does. |
+
+The symmetric and alternating backends translate both clouds by their joint mass-weighted centroid, in FP32,
+before solving; the multiscale backend preprocesses on its own and the low-level solvers do not. The cost is
+translation invariant, so nothing changes in exact arithmetic, and a common offset no longer enters the FP32 rounding
+of `|x|^2`, which the solvers subtract explicitly. That rounding is relative to `|x|^2`, so clouds spread far from
+their centroid can still lose accuracy at small `eps`.
 
 #### Performance
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `half_cost` | `bool` | `False` | Use halved cost C(x,y) = ‖x−y‖²/2 (matches GeomLoss p=2 default). |
-| `pad_to_multiple` | `int` or `None` | `None` | Pad point clouds to next multiple of this value before Triton kernels. Eliminates JIT recompilation overhead when solving OT with varying (n, m) sizes. Must be a positive multiple of 32 (recommended: 128). |
+| `pad_to_multiple` | `int` or `None` | `None` | Pad point clouds with zero-weight points to the next multiple of this value, so that problems of varying (n, m) share kernel shapes and can trigger fewer compilations and autotuning runs. Must be a positive multiple of 32. |
 
 #### Kernel Tuning (Advanced)
 
@@ -153,6 +172,16 @@ Control marginal relaxation via `reach`, `reach_x`, and `reach_y` parameters. Th
 | `hvp_cg_rtol` | `float` | `1e-6` | Relative tolerance for CG. |
 | `hvp_cg_atol` | `float` | `1e-6` | Absolute tolerance for CG. |
 | `hvp_preconditioner` | `str` | `"none"` | Preconditioner: `"none"`, `"jacobi"`, `"neumann"`. |
+
+Hessian-vector products (a double backward) are supported with respect to `x` for the raw OT cost, with `y` and the
+weights fixed, `debias=False` and no active label cost; the loss may enter a nonlinear function (`loss ** 2`, ...).
+A `y` that requires a gradient, `debias=True` or an active label cost raises `NotImplementedError`; second
+derivatives involving the weights, and third derivatives, are not supported and not all of them are caught. The
+product assumes converged potentials. For balanced problems `hvp_tau2` regularizes the linear solve and biases the
+product; relaxed marginals ignore it. If the conjugate gradients do not meet their tolerance on the true residual
+within `hvp_max_cg_iter`, a `RuntimeWarning` says so. Meeting it does not certify the product: ill-conditioned
+balanced problems (weakly coupled clusters, wide clouds at small `eps`) can have large errors, and lowering
+`hvp_tau2` can make them worse.
 
 ---
 
@@ -242,6 +271,10 @@ cost = loss(x, y)
 grad_x = torch.autograd.grad(cost, x)[0]
 ```
 
+At convergence this is the gradient of the OT cost. Before convergence, with the symmetric backend's final
+extrapolation, it is the gradient through the stopped final update, as in GeomLoss (without its relaxed-marginal
+factor), not the total derivative of the finite run.
+
 ### Hessian-Vector Product (HVP)
 
 ```python
@@ -275,7 +308,7 @@ loss = SamplesLoss(
     "sinkhorn",
     blur=0.1,
     allow_tf32=False,  # Disable TF32 for strict FP32
-    use_exp2=True,     # Keep exp2 for stability
+    use_exp2=True,     # Compute LSE with exp2/log2
 )
 ```
 
@@ -306,12 +339,12 @@ loss = SamplesLoss(
 
 x = torch.randn(4096, 64, device="cuda")
 y = torch.randn(4096, 64, device="cuda")
-cost = loss(x, y)  # Matches OTT-JAX's sinkhorn() output
+cost = loss(x, y)  # OTT-JAX's alternating updates
 ```
 
 **When to use Alternating backend:**
 - Benchmarking against OTT-JAX
-- Reproducing OTT-JAX results exactly
+- Comparing with OTT-JAX (match cost, eps, weights and potential conventions; unconverged iterates need not match)
 - Research comparing iteration styles
 
 **When to use symmetric backend (default):**
@@ -417,7 +450,7 @@ loss = SamplesLoss(
 ### Early Stopping (OTT-JAX Style)
 
 ```python
-# Enable early stopping for 2-4x speedup
+# Stop once the potential change between checks falls below the threshold
 loss = SamplesLoss(
     "sinkhorn",
     blur=0.1,
@@ -428,17 +461,9 @@ loss = SamplesLoss(
     inner_iterations=10,      # Check every 10 iterations
 )
 
-# Typical behavior: converges in ~20-30 iterations instead of 100
+# How many iterations this saves depends on the problem and the threshold
 cost = loss(x, y)
 ```
-
-**Performance (n=1000, d=784):**
-
-| Threshold | Time | Speedup | Loss Parity |
-|-----------|------|---------|-------------|
-| None (all 100 iters) | 54 ms | 1.0x | — |
-| 1e-3 | 16 ms | **3.4x** | 0.00% |
-| 1e-6 | 26 ms | **2.1x** | 0.00% |
 
 ### Adaptive Padding (Variable-Size OT)
 
@@ -453,9 +478,9 @@ loss = SamplesLoss(
     pad_to_multiple=128,  # Pad n and m to next multiple of 128
 )
 
-# All sizes now hit the same cached Triton kernels
+# Sizes that pad to the same (n, m) reuse the compiled kernels
 for x_i, y_i, a_i, b_i in variable_size_problems:
-    cost = loss(a_i, x_i, b_i, y_i)  # No recompilation!
+    cost = loss(a_i, x_i, b_i, y_i)
 ```
 
 **How it works:**
@@ -465,10 +490,8 @@ for x_i, y_i, a_i, b_i in variable_size_problems:
 - Potentials (`potentials=True`) are automatically trimmed to original size
 - Early stopping convergence checks are masked to unpadded entries
 
-**Recommended values:**
-- `pad_to_multiple=128`: Best recompilation reduction (recommended)
-- `pad_to_multiple=64`: Lower memory overhead for small n
-- `pad_to_multiple=None`: No padding (default, backward compatible)
+**Choosing the multiple:** a larger multiple gives fewer distinct shapes but pads more points; `None` (the default)
+pads nothing.
 
 ---
 
@@ -494,7 +517,7 @@ f, g = sinkhorn_flashstyle_symmetric(
 
 # Alternating solver (matches OTT-JAX interface)
 f, g = sinkhorn_flashstyle_alternating(
-    x, y, log_a, log_b,
+    x, y, a, b,
     eps=0.1,
     n_iters=100,
 )
@@ -508,13 +531,13 @@ from flash_sinkhorn.kernels import apply_plan_vec_flashstyle, apply_plan_mat_fla
 # Apply transport plan to a vector: result_i = sum_j P(i,j) * v_j
 result = apply_plan_vec_flashstyle(
     x, y, f_shift, g_shift, log_a, log_b, v,
-    eps=0.1, cost_scale=0.5,
+    eps=0.1, axis=1, cost_scale=0.5,
 )
 
 # Apply transport plan to a matrix: result_i = sum_j P(i,j) * M_j
 result = apply_plan_mat_flashstyle(
     x, y, f_shift, g_shift, log_a, log_b, M,
-    eps=0.1, cost_scale=0.5,
+    eps=0.1, axis=1, cost_scale=0.5,
 )
 ```
 
@@ -640,11 +663,11 @@ grad_x, grad_psi = torch.autograd.grad(loss, [x, psi])
 | Feature | FlashSinkhorn | GeomLoss |
 |---------|-----------|----------|
 | Cost function | Squared Euclidean only | Multiple (Euclidean, Laplacian, etc.) |
-| Backend | Triton (symmetric, alternating, multiscale) | PyTorch (tensorized, symmetric, multiscale) |
+| Backend | Triton (symmetric, alternating, multiscale) | PyTorch / KeOps (tensorized, online, multiscale) |
 | Unbalanced OT | Yes (`reach`, `reach_x`, `reach_y`) | Yes (`reach`) |
 | Semi-unbalanced OT | Yes (`reach_x` ≠ `reach_y`) | No |
 | Debiased Sinkhorn | Yes (`debias=True`) | Yes |
-| Early stopping | Yes (`threshold`, 2-4x speedup) | No (epsilon-scaling only) |
+| Early stopping | Yes (`threshold`) | No (epsilon-scaling only) |
 | Adaptive padding | Yes (`pad_to_multiple`, variable-size OT) | No |
 | Gradient | Analytic (no backprop; not for multiscale) | Analytic (no backprop) |
 | HVP | Yes (CG solver; not for multiscale) | No |
@@ -657,11 +680,11 @@ grad_x, grad_psi = torch.autograd.grad(loss, [x, psi])
 from geomloss import SamplesLoss as GeomLossSamplesLoss
 loss_geo = GeomLossSamplesLoss("sinkhorn", blur=0.1, scaling=0.5, debias=False)
 
-# FlashSinkhorn (drop-in replacement for balanced OT)
+# FlashSinkhorn with the same settings
 from flash_sinkhorn import SamplesLoss
-loss_tri = SamplesLoss("sinkhorn", blur=0.1, scaling=0.5, debias=False)
+loss_tri = SamplesLoss("sinkhorn", blur=0.1, scaling=0.5, debias=False, half_cost=True, allow_tf32=False)
 
-# Both work the same way
+# Same cost convention (GeomLoss p=2 is |x-y|^2/2); values agree to numerical tolerance
 cost_geo = loss_geo(x, y)
 cost_tri = loss_tri(x, y)
 ```
@@ -674,7 +697,7 @@ cost_tri = loss_tri(x, y)
 
 FlashSinkhorn uses **full squared Euclidean cost**: `C(x,y) = ||x - y||²`
 
-The epsilon schedule uses `eps = blur^p` (same as GeomLoss), providing exact potential parity when using matching cost functions:
+The epsilon schedule uses `eps = blur^p`, as in GeomLoss. To compare raw OT potentials, set `potentials=True` and `debias=False` in both libraries and match the cost, weights, schedule and precision:
 
 ```python
 # For potential parity with FlashSinkhorn, use full squared cost
@@ -684,7 +707,7 @@ def full_sqdist_cost(x, y):
 loss_geo = GeomLossSamplesLoss("sinkhorn", cost=full_sqdist_cost, ...)
 loss_tri = SamplesLoss("sinkhorn", ...)
 
-# Potentials will now match exactly (rtol=1e-4)
+# Raw potentials agree to numerical tolerance (balanced ones up to an additive constant)
 ```
 
 ### Potential Conventions
@@ -721,6 +744,5 @@ f, g = shifted_to_standard_potentials(f_shift, g_shift, alpha, beta)
 
 ### Numerical Stability
 
-- Use `use_exp2=True` (default) for FlashAttention-like exp2/log2 stability
 - Set `allow_tf32=False` for strict FP32 when comparing against CPU references
-- For very small `blur` values, increase `n_iters` or use epsilon-scaling
+- For very small `blur`, use a slower schedule (`scaling` closer to 1) followed by more iterations at the target epsilon (`eps_list`), and check convergence; `n_iters` truncates an annealing schedule and never extends it
