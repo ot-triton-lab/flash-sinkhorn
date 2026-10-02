@@ -231,3 +231,76 @@ def sinkhorn_geomloss_barycentric_grads_ref(x, y, a, b, f, g, eps: float):
     grad_y = 2.0 * b_f[:, None] * (y_f - x_bar)
 
     return grad_x, grad_y
+
+
+
+def _sqdist_exact(x, y):
+    """|x_i - y_j|^2 in the input dtype, without the expanded-square cancellation."""
+    return ((x[:, None, :] - y[None, :, :]) ** 2).sum(dim=-1)
+
+
+def unbalanced_sinkhorn_ref(x, y, a, b, eps: float, n_iters: int, rho_x=None, rho_y=None, f_init=None, g_init=None):
+    """Dense log-domain Sinkhorn at a fixed eps with optional KL marginal penalties (GeomLoss convention).
+
+    ``rho_x`` relaxes the source marginal and ``rho_y`` the target marginal; ``None`` keeps a marginal exact.
+    Symmetric updates, each potential averaged with its previous value. Returns ``(f, g)`` with the plan
+    ``P = diag(a) exp((f + g - C) / eps) diag(b)``.
+    """
+    C = _sqdist_exact(x, y)
+    damp_f = 1.0 if rho_x is None else 1.0 / (1.0 + eps / rho_x)
+    damp_g = 1.0 if rho_y is None else 1.0 / (1.0 + eps / rho_y)
+    f = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype) if f_init is None else f_init
+    g = torch.zeros(y.shape[0], device=y.device, dtype=y.dtype) if g_init is None else g_init
+    for _ in range(n_iters):
+        f_new = -eps * damp_f * torch.logsumexp(b.log()[None, :] + (g[None, :] - C) / eps, dim=1)
+        g_new = -eps * damp_g * torch.logsumexp(a.log()[:, None] + (f[:, None] - C) / eps, dim=0)
+        f, g = 0.5 * (f + f_new), 0.5 * (g + g_new)
+    return f, g
+
+
+def unbalanced_value_and_grad_ref(x, y, a, b, f, g, eps: float, rho_x=None, rho_y=None):
+    """Value of entropic OT at optimal potentials and its gradient with respect to x (cost ``|x - y|^2``).
+
+    The value is the dual objective, which equals the primal value at the optimum; the gradient is
+    ``sum_j P_ij d/dx_i |x_i - y_j|^2`` (envelope theorem).
+    """
+    C = _sqdist_exact(x, y)
+    P = a[:, None] * b[None, :] * torch.exp((f[:, None] + g[None, :] - C) / eps)
+
+    def side(w, pot, rho):
+        return (w * pot).sum() if rho is None else rho * (w * (1 - torch.exp(-pot / rho))).sum()
+
+    value = side(a, f, rho_x) + side(b, g, rho_y) - eps * (P.sum() - 1)
+    grad_x = 2 * (P.sum(dim=1)[:, None] * x - P @ y)
+    return value, grad_x, P
+
+
+def unbalanced_hvp_x_ref(x, y, a, b, f, g, v, eps: float, rho_x=None, rho_y=None):
+    """Hessian-vector product of entropic OT with respect to x (cost ``|x - y|^2``, y fixed), at optimal potentials.
+
+    Differentiates the fixed point ``f = k_x softmin_eps(g - C)``, ``g = k_y softmin_eps(f - C)`` with
+    ``k = 1 / (1 + eps / rho)`` (1 for a strict marginal) by a dense linear solve, then differentiates the
+    gradient ``2 (P1 * x - P y)``. For balanced OT the shift (c, -c) is fixed by setting the last dg to 0.
+    """
+    C = _sqdist_exact(x, y)
+    P = a[:, None] * b[None, :] * torch.exp((f[:, None] + g[None, :] - C) / eps)
+    r, c = P.sum(dim=1), P.sum(dim=0)
+    k_x = 1.0 if rho_x is None else 1.0 / (1.0 + eps / rho_x)
+    k_y = 1.0 if rho_y is None else 1.0 / (1.0 + eps / rho_y)
+    row, col = P / r[:, None], P / c[None, :]  # the softmin weights of the two updates
+    dC = 2 * ((x[:, None, :] - y[None, :, :]) * v[:, None, :]).sum(dim=-1)
+    n, m = P.shape
+    M = torch.zeros(n + m, n + m, dtype=x.dtype, device=x.device)
+    M[:n, :n] = torch.eye(n, dtype=x.dtype, device=x.device)
+    M[n:, n:] = torch.eye(m, dtype=x.dtype, device=x.device)
+    M[:n, n:] = k_x * row
+    M[n:, :n] = k_y * col.T
+    rhs = torch.cat([k_x * (row * dC).sum(dim=1), k_y * (col * dC).sum(dim=0)])
+    if rho_x is None and rho_y is None:
+        # Balanced potentials are unique up to (c, -c), so M is singular: fix the last entry of dg at 0.
+        sol = torch.cat([torch.linalg.solve(M[:-1, :-1], rhs[:-1]), rhs.new_zeros(1)])
+    else:
+        sol = torch.linalg.solve(M, rhs)
+    df, dg = sol[:n], sol[n:]
+    dP = P * (df[:, None] + dg[None, :] - dC) / eps
+    return 2 * (dP.sum(dim=1)[:, None] * x - dP @ y + r[:, None] * v)

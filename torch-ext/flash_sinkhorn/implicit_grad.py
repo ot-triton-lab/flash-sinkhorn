@@ -52,7 +52,7 @@ def implicit_grad_x_from_potentials(
     allow_tf32: bool = False,
     use_exp2: bool = True,
 ) -> Tuple[torch.Tensor, ImplicitGradInfo]:
-    """Compute implicit gradient ∂L/∂x via IFT.
+    """Compute implicit gradient ∂L/∂x via IFT. Balanced OT only.
 
     This is equivalent to what OTT-JAX's ImplicitDiff computes.
 
@@ -262,7 +262,7 @@ def implicit_grad_x(
     autotune: bool = True,
     use_flashstyle: Optional[bool] = None,  # Deprecated, FlashSinkhorn is the only backend
 ) -> Tuple[torch.Tensor, ImplicitGradInfo]:
-    """End-to-end implicit gradient: solve Sinkhorn then compute ∂L/∂x.
+    """End-to-end implicit gradient: solve Sinkhorn then compute ∂L/∂x. Balanced OT only.
 
     This is equivalent to calling jax.grad on a loss through OTT-JAX Sinkhorn
     with ImplicitDiff.

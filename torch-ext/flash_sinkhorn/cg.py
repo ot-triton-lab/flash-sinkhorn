@@ -61,7 +61,9 @@ def conjugate_gradient(
     x : torch.Tensor
         Solution vector
     info : CGInfo
-        Convergence information
+        Convergence information. Convergence is decided on the true residual ``b - A x``: the recursively updated
+        residual drifts in floating point and can fall below the tolerance while the true one does not, in which
+        case the iteration restarts from the true residual.
     """
 
     stabilise_every_i = int(stabilise_every)
@@ -81,12 +83,16 @@ def conjugate_gradient(
 
     init_res = float(torch.linalg.norm(r).detach().cpu())
     tol = max(atol, rtol * init_res)
+    if init_res <= tol:  # x0 already solves the system (for instance a zero right-hand side)
+        return x, CGInfo(cg_converged=True, cg_iters=0, cg_residual=init_res, cg_initial_residual=init_res)
 
     cg_converged = False
+    iters = int(max_iter)
     for it in range(int(max_iter)):
         Ap = matvec(p)
         denom = torch.dot(p, Ap)
         if denom.abs() == 0:
+            iters = it
             break
         alpha = rz_old / denom
         x = x + alpha * p
@@ -96,27 +102,29 @@ def conjugate_gradient(
             r = b - matvec(x)
 
         res = float(torch.linalg.norm(r).detach().cpu())
+        restart = False
         if res <= tol:
-            cg_converged = True
-            iters = it + 1
-            return x, CGInfo(
-                cg_converged=True,
-                cg_iters=iters,
-                cg_residual=res,
-                cg_initial_residual=init_res,
-            )
+            r = b - matvec(x)  # confirm on the true residual
+            if float(torch.linalg.norm(r).detach().cpu()) <= tol:
+                cg_converged = True
+                iters = it + 1
+                break
+            restart = True  # the recursive residual drifted: restart from the true one
 
         z = preconditioner(r) if preconditioner is not None else r
         rz_new = torch.dot(r, z)
-        beta = rz_new / rz_old
-        p = z + beta * p
+        if restart:
+            p = z.clone()
+        else:
+            beta = rz_new / rz_old
+            p = z + beta * p
         rz_old = rz_new
 
-    res = float(torch.linalg.norm(r).detach().cpu())
+    true_res = float(torch.linalg.norm(b - matvec(x)).detach().cpu())
     return x, CGInfo(
-        cg_converged=cg_converged,
-        cg_iters=int(max_iter),
-        cg_residual=res,
+        cg_converged=cg_converged or true_res <= tol,
+        cg_iters=iters,
+        cg_residual=true_res,
         cg_initial_residual=init_res,
     )
 

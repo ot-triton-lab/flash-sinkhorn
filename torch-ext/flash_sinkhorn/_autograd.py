@@ -10,6 +10,7 @@ Contains:
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -128,7 +129,11 @@ class _SinkhornGradFn(torch.autograd.Function):
         label_cost_matrix: Optional[torch.Tensor] = None,
         lambda_x: float = 1.0,
         lambda_y: float = 0.0,
+        f_mass: Optional[torch.Tensor] = None,
+        g_mass: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        # The gradient is computed at grad_scale = 1 and scaled afterwards, so that the double backward can return
+        # its derivative with respect to grad_scale, which a loss composed with a nonlinear function needs.
         gx, gy = sinkhorn_geomloss_online_grad_sqeuclid(
             x,
             y,
@@ -145,7 +150,7 @@ class _SinkhornGradFn(torch.autograd.Function):
             num_warps=num_warps,
             num_stages=int(num_stages),
             autotune=bool(autotune),
-            grad_scale=grad_scale,
+            grad_scale=torch.ones_like(grad_scale),
             compute_grad_x=bool(compute_grad_x),
             compute_grad_y=bool(compute_grad_y),
             cost_scale=float(cost_scale),
@@ -155,8 +160,21 @@ class _SinkhornGradFn(torch.autograd.Function):
             lambda_x=float(lambda_x),
             lambda_y=float(lambda_y),
         )
+        # The kernel returns the balanced gradient a_i * 2cs (x_i - T_i), where T_i is the barycentre under the
+        # weights of the last update (built from f_grad, g_grad). Under a KL penalty the row masses of the plan
+        # are a_i exp(-f_i / rho_x) at the returned potentials (columns: b_j exp(-g_j / rho_y)), so the rows are
+        # rescaled by them. With the final extrapolation this is GeomLoss's gradient through the stopped last
+        # update (balanced or one common reach), without the factor (rho + eps/2) / (rho + eps) its relaxed
+        # gradients carry. At convergence it is the OT gradient; before convergence it is not the total derivative
+        # of the finite run, and the implicit HVP is not the derivative of this construction.
+        f_mass = f_grad if f_mass is None else f_mass
+        g_mass = g_grad if g_mass is None else g_mass
+        if rho_x is not None and gx is not None:
+            gx = gx * torch.exp(-f_mass.float().masked_fill(a == 0, 0) / rho_x).to(gx.dtype)[:, None]
+        if rho_y is not None and gy is not None:
+            gy = gy * torch.exp(-g_mass.float().masked_fill(b == 0, 0) / rho_y).to(gy.dtype)[:, None]
 
-        ctx.save_for_backward(x, y, a, b, f_grad, g_grad, grad_scale)
+        ctx.save_for_backward(x, y, a, b, f_grad, g_grad, grad_scale, gx)
         ctx.eps = float(eps)
         ctx.allow_tf32 = bool(allow_tf32)
         ctx.use_exp2 = bool(use_exp2)
@@ -181,16 +199,19 @@ class _SinkhornGradFn(torch.autograd.Function):
             label_x is not None and label_y is not None
             and label_cost_matrix is not None and lambda_y != 0.0
         )
-        return gx, gy
+        return (None if gx is None else gx * grad_scale), (None if gy is None else gy * grad_scale)
 
     @staticmethod
     def backward(  # type: ignore[override]
         ctx, grad_grad_x: Optional[torch.Tensor], grad_grad_y: Optional[torch.Tensor]
     ):
-        x, y, a, b, f_grad, g_grad, grad_scale = ctx.saved_tensors
+        x, y, a, b, f_grad, g_grad, grad_scale, gx_unit = ctx.saved_tensors
 
         if grad_grad_y is not None:
-            raise NotImplementedError("Double backward w.r.t y is not implemented yet.")
+            raise NotImplementedError(
+                "Hessian-vector products are implemented with respect to x only: y must not require a gradient, "
+                "and debias must be False (the debiased cost's self term OT(x, x) has x on both sides)."
+            )
 
         if ctx.use_label_cost:
             raise NotImplementedError(
@@ -214,7 +235,7 @@ class _SinkhornGradFn(torch.autograd.Function):
                 f_hat, g_hat = geomloss_to_ott_potentials(
                     f_grad, g_grad, a, b, eps=ctx.eps
                 )
-                hvp_x, _ = hvp_x_sqeuclid_from_potentials(
+                hvp_x, info = hvp_x_sqeuclid_from_potentials(
                     x,
                     y,
                     f_hat,
@@ -240,55 +261,45 @@ class _SinkhornGradFn(torch.autograd.Function):
                     num_warps=int(ctx.num_warps or 4),
                     num_stages=ctx.num_stages,
                 )
+                if not info.cg_converged:
+                    required = max(ctx.hvp_cg_atol, ctx.hvp_cg_rtol * info.cg_initial_residual)
+                    warnings.warn(
+                        f"Hessian-vector product: conjugate gradients did not confirm convergence after "
+                        f"{info.cg_iters} iterations (residual {info.cg_residual:.3g}, required <= {required:.3g}), "
+                        "so the product may be inaccurate. Raising hvp_max_cg_iter may help. For balanced OT a larger "
+                        "hvp_tau2 can improve the conditioning but changes the product; relaxed marginals ignore it.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 out_x = hvp_x * grad_scale
 
-        # Inputs: x,y,a,b,f_grad,g_grad,eps,allow_tf32,use_exp2,autotune,
-        # block_m,block_n,block_k,num_warps,num_stages,grad_scale,
-        # hvp_tau2,hvp_max_cg_iter,hvp_cg_rtol,hvp_cg_atol,hvp_cg_stabilise_every,
-        # hvp_preconditioner,hvp_precond_terms,hvp_use_preconditioner,
-        # compute_grad_x, compute_grad_y, rho_x, rho_y, cost_scale,
-        # label_x, label_y, label_cost_matrix, lambda_x, lambda_y
-        return (
-            out_x,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,  # rho_x
-            None,  # rho_y
-            None,  # cost_scale
-            None,  # label_x
-            None,  # label_y
-            None,  # label_cost_matrix
-            None,  # lambda_x
-            None,  # lambda_y
-        )
+        # One entry per forward input; grad_scale is input 15. d(grad_x . v) / d grad_scale = <unit gradient, v>.
+        grads = [None] * len(ctx.needs_input_grad)
+        grads[0] = out_x
+        if grad_grad_x is not None and ctx.needs_input_grad[15] and gx_unit is not None:
+            grads[15] = (gx_unit * grad_grad_x).sum().reshape(grad_scale.shape)
+        return tuple(grads)
 
 
 # ---------------------------------------------------------------------------
 # Cost Function (forward: run Sinkhorn solver, backward: analytical gradient)
 # ---------------------------------------------------------------------------
+
+
+def _dual_cost(a, b, f, g, rho_x, rho_y, eps):
+    """Cost of balanced, unbalanced or semi-unbalanced entropic OT from its potentials (GeomLoss convention).
+
+    A strict marginal contributes ``<w, pot>``; a marginal relaxed by a KL penalty of strength ``rho``
+    contributes ``(rho + eps / 2) * <w, 1 - exp(-pot / rho)>``. For probability weights and optimal
+    potentials this equals the value of the primal problem; it is not the dual objective at other potentials.
+    """
+    def side(w, pot, rho):
+        pot = torch.where(w > 0, pot, torch.zeros_like(pot))  # 0 * inf would give nan
+        if rho is None:
+            return (w * pot).sum()
+        return (rho + eps / 2) * (w * (1 - (-pot / rho).exp())).sum()
+
+    return side(a, f, rho_x) + side(b, g, rho_y)
 
 
 class _SinkhornCostFn(torch.autograd.Function):
@@ -337,6 +348,8 @@ class _SinkhornCostFn(torch.autograd.Function):
                 autotune=config.autotune,
                 allow_tf32=config.allow_tf32,
                 use_exp2=config.use_exp2,
+                threshold=config.threshold,
+                check_every=config.inner_iterations,
                 n_orig=config.n_orig,
                 m_orig=config.m_orig,
             )
@@ -361,7 +374,7 @@ class _SinkhornCostFn(torch.autograd.Function):
             ctx.lambda_y = 0.0
             ctx.config = config
 
-            return (a * f_cost).sum() + (b * g_cost).sum()
+            return _dual_cost(a, b, f_cost, g_cost, config.rho_x, config.rho_y, eps)
 
         # GeomLoss backend (default): symmetric-update Sinkhorn
         if config.last_extrapolation:
@@ -375,6 +388,7 @@ class _SinkhornCostFn(torch.autograd.Function):
                 use_epsilon_scaling=config.use_epsilon_scaling,
                 eps=config.eps,
                 n_iters=config.n_iters,
+                eps_list=list(eps_list),
                 allow_tf32=config.allow_tf32,
                 use_exp2=config.use_exp2,
                 autotune=config.autotune,
@@ -404,6 +418,7 @@ class _SinkhornCostFn(torch.autograd.Function):
                 use_epsilon_scaling=config.use_epsilon_scaling,
                 eps=config.eps,
                 n_iters=config.n_iters,
+                eps_list=list(eps_list),
                 allow_tf32=config.allow_tf32,
                 use_exp2=config.use_exp2,
                 autotune=config.autotune,
@@ -442,26 +457,7 @@ class _SinkhornCostFn(torch.autograd.Function):
         ctx.lambda_y = config.lambda_y
         ctx.config = config
 
-        # Cost computation: differs for balanced vs unbalanced/semi-unbalanced OT
-        is_balanced_x = config.rho_x is None
-        is_balanced_y = config.rho_y is None
-
-        if is_balanced_x and is_balanced_y:
-            return (a * f_cost).sum() + (b * g_cost).sum()
-        else:
-            is_semi_unbalanced = is_balanced_x != is_balanced_y
-
-            if is_semi_unbalanced:
-                return (a * f_cost).sum() + (b * g_cost).sum()
-            else:
-                cost = torch.tensor(0.0, device=x.device, dtype=torch.float32)
-                unbal_weight_x = config.rho_x + ctx.eps / 2
-                cost_a = (a * (1 - (-f_cost / config.rho_x).exp())).sum()
-                cost = cost + unbal_weight_x * cost_a
-                unbal_weight_y = config.rho_y + ctx.eps / 2
-                cost_b = (b * (1 - (-g_cost / config.rho_y).exp())).sum()
-                cost = cost + unbal_weight_y * cost_b
-                return cost
+        return _dual_cost(a, b, f_cost, g_cost, config.rho_x, config.rho_y, ctx.eps)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -505,14 +501,24 @@ class _SinkhornCostFn(torch.autograd.Function):
                 ctx.label_cost_matrix_stored,
                 ctx.lambda_x,
                 ctx.lambda_y,
+                f_cost,
+                g_cost,
             )
             grad_x = gx if x.requires_grad else None
             grad_y = gy if y.requires_grad else None
 
+        def weight_grad(w, pot, rho):
+            # d OT / d w: the potential on a strict side, (rho + eps)(1 - exp(-pot / rho)) on a relaxed one
+            # (probability weights; the normalization in SamplesLoss adds its own chain rule).
+            if rho is None:
+                return pot
+            pot = torch.where(w > 0, pot, torch.zeros_like(pot))
+            return (rho + ctx.eps) * (1 - (-pot / rho).exp())
+
         if a.requires_grad:
-            grad_a = grad_out * f_cost
+            grad_a = grad_out * weight_grad(a, f_cost, ctx.rho_x)
         if b.requires_grad:
-            grad_b = grad_out * g_cost
+            grad_b = grad_out * weight_grad(b, g_cost, ctx.rho_y)
 
         # Returns: x, y, a, b, eps_list, config, label_x, label_y, label_cost_matrix
         return (

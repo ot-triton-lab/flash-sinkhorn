@@ -14,6 +14,7 @@ separation between Triton kernel code and solver logic.
 
 from __future__ import annotations
 
+import warnings
 from typing import Optional, Sequence, Tuple
 
 import torch
@@ -25,6 +26,39 @@ from .kernels.sinkhorn_flashstyle_sqeuclid import (
     flashsinkhorn_symmetric_step,
     shifted_to_standard_potentials,
 )
+
+
+def _warn_not_converged(threshold: float, n_iters: int, checked: bool) -> None:
+    """A threshold was given and the potential-change test never passed, so convergence to it is not confirmed."""
+    if checked:
+        why = (f"was not confirmed by the potential-change checks within {n_iters} updates. These checks are not a "
+               "marginal-residual certificate.")
+    else:
+        why = ("was not confirmed: no potential-change comparison ran at the target eps. Use more fixed-eps "
+               "iterations, or repeat the target eps in eps_list; n_iters does not extend an automatic schedule.")
+    warnings.warn(f"Sinkhorn: convergence to threshold={threshold:g} {why}", RuntimeWarning, stacklevel=3)
+
+
+def _translate_semi_unbalanced(f_hat, g_hat, alpha, beta, log_a, log_b, rho_x, rho_y):
+    """Maximize the dual along (f + c, g - c) when exactly one marginal is relaxed.
+
+    Semi-unbalanced Sinkhorn converges slowly along this direction (Séjourné, Vialard and Peyré, 2022). The
+    entropic term does not depend on c, so the best c has a closed form: for a relaxed target,
+    c = rho_y * (log sum(a) - log <b, exp(-g / rho_y)>), and the mirror image for a relaxed source. Works on
+    shifted potentials (f_hat = f - alpha, g_hat = g - beta); otherwise returns them unchanged.
+    """
+    if (rho_x is None) == (rho_y is None):
+        return f_hat, g_hat
+
+    def lse(log_w, t):
+        # log_weights() encodes a zero weight as -1e5; such entries must not enter the sum.
+        return torch.logsumexp(t.masked_fill(log_w <= -1e5, -torch.inf), 0)
+
+    if rho_y is not None:
+        c = rho_y * (lse(log_a, log_a) - lse(log_b, log_b - (g_hat + beta) / rho_y))
+        return f_hat + c, g_hat - c
+    c = rho_x * (lse(log_b, log_b) - lse(log_a, log_a - (f_hat + alpha) / rho_x))
+    return f_hat - c, g_hat + c
 
 
 def sinkhorn_flashstyle_alternating(
@@ -135,6 +169,9 @@ def sinkhorn_flashstyle_alternating(
     # Semi-unbalanced OT: damping_f = 1/(1+eps/rho_x), damping_g = 1/(1+eps/rho_y)
     # CRITICAL FIX: rho_x controls SOURCE marginal → damps f potential
     #               rho_y controls TARGET marginal → damps g potential
+    if ott_convention and (rho_x is not None or rho_y is not None):
+        raise NotImplementedError("ott_convention=True supports balanced OT only; for unbalanced OT use the default "
+                                  "convention (SamplesLoss(backend='alternating', reach=...)).")
     damp_f = dampening(eps, rho_x)
     damp_g = dampening(eps, rho_y)
 
@@ -161,6 +198,8 @@ def sinkhorn_flashstyle_alternating(
     prev_g_hat = g_hat.clone() if threshold is not None else None
 
     n_iters_used = 0
+    converged = False  # set when the threshold test passes
+    checked = False  # set when a threshold comparison has run
 
     if ott_convention:
         # =================================================================
@@ -198,7 +237,7 @@ def sinkhorn_flashstyle_alternating(
             v = f_hat / eps  # Use current f_hat (shifted)
             g_hat_lse = flashsinkhorn_lse(
                 y_f32, x_f32, v, eps, cost_scale=cost_scale,
-                damping=damp_g,  # Semi-unbalanced: damp_g = 1/(1+eps/rho_x)
+                damping=damp_g,  # 1.0: this branch is balanced only
                 allow_tf32=allow_tf32,
                 use_exp2=use_exp2,
                 autotune=autotune,
@@ -210,7 +249,7 @@ def sinkhorn_flashstyle_alternating(
             u = g_hat / eps  # Bias is updated g_hat divided by eps
             f_hat_lse = flashsinkhorn_lse(
                 x_f32, y_f32, u, eps, cost_scale=cost_scale,
-                damping=damp_f,  # Semi-unbalanced: damp_f = 1/(1+eps/rho_y)
+                damping=damp_f,  # 1.0: this branch is balanced only
                 allow_tf32=allow_tf32,
                 use_exp2=use_exp2,
                 autotune=autotune,
@@ -223,11 +262,13 @@ def sinkhorn_flashstyle_alternating(
 
             # Early stopping check
             if threshold is not None and (i + 1) % check_every == 0:
+                checked = True
                 _no = n_orig if n_orig is not None else len(f_hat)
                 _mo = m_orig if m_orig is not None else len(g_hat)
                 f_change = (f_hat[:_no] - prev_f_hat[:_no]).abs().max().item()
                 g_change = (g_hat[:_mo] - prev_g_hat[:_mo]).abs().max().item()
                 if max(f_change, g_change) < threshold:
+                    converged = True
                     break
                 prev_f_hat.copy_(f_hat)
                 prev_g_hat.copy_(g_hat)
@@ -247,35 +288,45 @@ def sinkhorn_flashstyle_alternating(
             # FUSED: kernel computes bias = g_hat/eps + log_b in SRAM
             f_hat = flashsinkhorn_lse_fused(
                 x_f32, y_f32, g_hat, log_b, eps, cost_scale=cost_scale,
-                damping=damp_f,  # Semi-unbalanced: damp_f = 1/(1+eps/rho_y)
+                damping=damp_f,  # 1/(1+eps/rho_x) when the source marginal is relaxed
                 allow_tf32=allow_tf32,
                 use_exp2=use_exp2,
                 autotune=autotune,
             )
+            if damp_f != 1.0:
+                # The kernel damps the shifted potential; damping f = f_hat + alpha also scales alpha.
+                f_hat = f_hat + (damp_f - 1.0) * alpha
 
             # g-update: ĝ = -ε * LSE_i[y·x^T * coord_scale/ε + f̂/ε + log(a)]
             # FUSED: kernel computes bias = f_hat/eps + log_a in SRAM
             g_hat = flashsinkhorn_lse_fused(
                 y_f32, x_f32, f_hat, log_a, eps, cost_scale=cost_scale,
-                damping=damp_g,  # Semi-unbalanced: damp_g = 1/(1+eps/rho_x)
+                damping=damp_g,  # 1/(1+eps/rho_y) when the target marginal is relaxed
                 allow_tf32=allow_tf32,
                 use_exp2=use_exp2,
                 autotune=autotune,
             )
+            if damp_g != 1.0:
+                g_hat = g_hat + (damp_g - 1.0) * beta
+            f_hat, g_hat = _translate_semi_unbalanced(f_hat, g_hat, alpha, beta, log_a, log_b, rho_x, rho_y)
 
             n_iters_used += 1
 
             # Early stopping check
             if threshold is not None and (i + 1) % check_every == 0:
+                checked = True
                 _no = n_orig if n_orig is not None else len(f_hat)
                 _mo = m_orig if m_orig is not None else len(g_hat)
                 f_change = (f_hat[:_no] - prev_f_hat[:_no]).abs().max().item()
                 g_change = (g_hat[:_mo] - prev_g_hat[:_mo]).abs().max().item()
                 if max(f_change, g_change) < threshold:
+                    converged = True
                     break
                 prev_f_hat.copy_(f_hat)
                 prev_g_hat.copy_(g_hat)
 
+    if threshold is not None and not converged:
+        _warn_not_converged(threshold, n_iters_used, checked)
     # Convert back to standard potentials
     if ott_convention:
         # OTT convention: potentials do NOT include ||x||², ||y||²
@@ -449,12 +500,18 @@ def sinkhorn_flashstyle_symmetric(
     prev_g = None
 
     n_iters_used = 0
+    converged = False  # set when the threshold test passes
+    checked = False  # set when a threshold comparison has run
 
-    # Precompute small vectors
+    # Precompute small vectors. With an active label cost the kernels weight the feature dot product by lambda_x,
+    # so the shifts must carry it too: C = cost_scale * (lambda_x |x - y|^2 + lambda_y W).
     x_f32 = x.float().contiguous()
     y_f32 = y.float().contiguous()
-    alpha = cost_scale * (x_f32 ** 2).sum(dim=1)
-    beta = cost_scale * (y_f32 ** 2).sum(dim=1)
+    label_active = (label_x is not None and label_y is not None
+                    and label_cost_matrix is not None and lambda_y != 0.0)
+    norm_scale = cost_scale * (lambda_x if label_active else 1.0)
+    alpha = norm_scale * (x_f32 ** 2).sum(dim=1)
+    beta = norm_scale * (y_f32 ** 2).sum(dim=1)
     log_a = log_weights(a)
     log_b = log_weights(b)
 
@@ -501,6 +558,7 @@ def sinkhorn_flashstyle_symmetric(
             f_hat = f_hat - 1.0 * alpha * (1.0 - damp_f)
         if damp_g < 1.0:
             g_hat = g_hat - 1.0 * beta * (1.0 - damp_g)
+        f_hat, g_hat = _translate_semi_unbalanced(f_hat, g_hat, alpha, beta, log_a, log_b, rho_x, rho_y)
         n_iters_used += 1
 
         # Symmetric updates with alpha=0.5 - FUSED kernel
@@ -525,19 +583,22 @@ def sinkhorn_flashstyle_symmetric(
                 f_hat = f_hat - 0.5 * alpha * (1.0 - damp_f)
             if damp_g < 1.0:
                 g_hat = g_hat - 0.5 * beta * (1.0 - damp_g)
+            f_hat, g_hat = _translate_semi_unbalanced(f_hat, g_hat, alpha, beta, log_a, log_b, rho_x, rho_y)
             n_iters_used += 1
 
             # Early stopping check (in shifted space)
-            if threshold is not None and (iter_idx + 1) % check_every == 0:
+            if threshold is not None and step_eps == eps_list[-1] and (iter_idx + 1) % check_every == 0:
                 if prev_f is None:
                     prev_f = f_hat.clone()
                     prev_g = g_hat.clone()
                 else:
+                    checked = True
                     _no = n_orig if n_orig is not None else len(f_hat)
                     _mo = m_orig if m_orig is not None else len(g_hat)
                     f_change = (f_hat[:_no] - prev_f[:_no]).abs().max().item()
                     g_change = (g_hat[:_mo] - prev_g[:_mo]).abs().max().item()
                     if max(f_change, g_change) < threshold:
+                        converged = True
                         break
                     prev_f.copy_(f_hat)
                     prev_g.copy_(g_hat)
@@ -563,6 +624,7 @@ def sinkhorn_flashstyle_symmetric(
                 f_hat = f_hat - 1.0 * alpha * (1.0 - damp_f)
             if damp_g < 1.0:
                 g_hat = g_hat - 1.0 * beta * (1.0 - damp_g)
+            f_hat, g_hat = _translate_semi_unbalanced(f_hat, g_hat, alpha, beta, log_a, log_b, rho_x, rho_y)
             n_iters_used += 1
 
     else:
@@ -616,6 +678,7 @@ def sinkhorn_flashstyle_symmetric(
         # alpha=1.0 means no averaging: new = candidate
         f_hat = f_cand
         g_hat = g_cand
+        f_hat, g_hat = _translate_semi_unbalanced(f_hat, g_hat, alpha, beta, log_a, log_b, rho_x, rho_y)
         n_iters_used += 1
 
         # Symmetric updates with alpha=0.5
@@ -653,19 +716,22 @@ def sinkhorn_flashstyle_symmetric(
             # Symmetric averaging: new = 0.5 * old + 0.5 * candidate
             f_hat = 0.5 * f_old + 0.5 * f_cand
             g_hat = 0.5 * g_old + 0.5 * g_cand
+            f_hat, g_hat = _translate_semi_unbalanced(f_hat, g_hat, alpha, beta, log_a, log_b, rho_x, rho_y)
             n_iters_used += 1
 
             # Early stopping check
-            if threshold is not None and (iter_idx + 1) % check_every == 0:
+            if threshold is not None and step_eps == eps_list[-1] and (iter_idx + 1) % check_every == 0:
                 if prev_f is None:
                     prev_f = f_hat.clone()
                     prev_g = g_hat.clone()
                 else:
+                    checked = True
                     _no = n_orig if n_orig is not None else len(f_hat)
                     _mo = m_orig if m_orig is not None else len(g_hat)
                     f_change = (f_hat[:_no] - prev_f[:_no]).abs().max().item()
                     g_change = (g_hat[:_mo] - prev_g[:_mo]).abs().max().item()
                     if max(f_change, g_change) < threshold:
+                        converged = True
                         break
                     prev_f.copy_(f_hat)
                     prev_g.copy_(g_hat)
@@ -705,8 +771,11 @@ def sinkhorn_flashstyle_symmetric(
             # alpha=1.0: no averaging
             f_hat = f_cand
             g_hat = g_cand
+            f_hat, g_hat = _translate_semi_unbalanced(f_hat, g_hat, alpha, beta, log_a, log_b, rho_x, rho_y)
             n_iters_used += 1
 
+    if threshold is not None and not converged:
+        _warn_not_converged(threshold, n_iters_used, checked)
     # Convert to standard potentials at the end
     f = f_hat + alpha
     g = g_hat + beta

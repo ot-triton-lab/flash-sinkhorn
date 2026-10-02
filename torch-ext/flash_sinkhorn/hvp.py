@@ -569,10 +569,10 @@ def hvp_x_sqeuclid_from_potentials(
     # - Mat1 = 2μI @ A (positive diagonal, PSD)
     # - Mat2, Mat3, Mat4, Mat5 = covariance terms (can cause indefiniteness)
     Mat1 = (2.0 * cost_scale) * a_hat[:, None] * A
-    Mat2 = (-4.0 * cost_scale / eps_f) * x * (vec1 * a_hat)[:, None]
-    Mat3 = (4.0 * cost_scale / eps_f) * Py * vec1[:, None]
+    Mat2 = (-4.0 * cost_scale**2 / eps_f) * x * (vec1 * a_hat)[:, None]
+    Mat3 = (4.0 * cost_scale**2 / eps_f) * Py * vec1[:, None]
     vec2 = torch.sum(Py * A, dim=1)
-    Mat4 = (4.0 * cost_scale / eps_f) * x * vec2[:, None]
+    Mat4 = (4.0 * cost_scale**2 / eps_f) * x * vec2[:, None]
 
     Mat5 = mat5_sqeuclid(
         x,
@@ -648,7 +648,7 @@ def hvp_x_sqeuclid(
     num_warps: Optional[int] = None,
     num_stages: int = 2,
 ) -> Tuple[torch.Tensor, HvpInfo]:
-    """End-to-end HVP: solve prelast potentials then compute H@A (w.r.t x)."""
+    """End-to-end HVP: solve prelast potentials then compute H@A (w.r.t x). Balanced OT only."""
 
     eps = float(eps_list[-1])
     f_grad, g_grad = sinkhorn_prelast_potentials_sqeuclid(

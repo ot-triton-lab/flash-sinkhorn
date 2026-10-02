@@ -42,6 +42,26 @@ class _ParsedInputs:
     b_view_shape: Tuple[int, ...]
 
 
+def _center_coords(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor, *, batched: bool):
+    """Translate both clouds by their joint mass-weighted centroid, in fp32.
+
+    Squared-Euclidean OT is translation invariant, so the cost, the potentials and the gradients are unchanged in
+    exact arithmetic. The symmetric and alternating solvers subtract alpha = cost_scale * |x|^2 from the potentials
+    explicitly; far from the origin the fp32 rounding of alpha approaches eps and destroys the potentials without
+    any error. The result is fp32 whatever the input dtype: subtracting in fp16 or bf16 can erase gaps the input
+    holds exactly and overflow finite fp16 inputs, and the solvers compute in fp32 anyway. The centroid is detached,
+    so it is a constant shift for autograd.
+    """
+    with torch.no_grad():
+        dims = 1 if batched else 0
+        total = (a.float().sum(dim=-1) + b.float().sum(dim=-1)).clamp_min(torch.finfo(torch.float32).tiny)
+        mu = ((a.float().unsqueeze(-1) * x.float()).sum(dim=dims)
+              + (b.float().unsqueeze(-1) * y.float()).sum(dim=dims)) / total.unsqueeze(-1)
+        if batched:
+            mu = mu.unsqueeze(1)
+    return x.float() - mu, y.float() - mu
+
+
 def _as_float_tensor(x: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(x):
         raise TypeError("Expected a torch.Tensor.")
@@ -295,7 +315,9 @@ class SamplesLoss(torch.nn.Module):
 
         C[i,j] = lambda_x * ||x_i - y_j||² + lambda_y * W[label_i, label_j]
 
-    Where W is a precomputed (V × V) label-to-label distance matrix.
+    Where W is a precomputed (V × V) label-to-label distance matrix, the whole multiplied by cost_scale. The label
+    term is active only when label_cost_matrix, both label vectors and lambda_y != 0 are given; otherwise the cost is
+    the plain feature cost and lambda_x is ignored.
 
     Example:
         loss = SamplesLoss(
@@ -626,6 +648,8 @@ class SamplesLoss(torch.nn.Module):
         if self.backend == "multiscale":
             return self._forward_multiscale(parsed, label_x, label_y)
 
+        cx, cy = _center_coords(parsed.x, parsed.y, parsed.a, parsed.b, batched=parsed.batched)
+        parsed = dataclasses.replace(parsed, x=cx, y=cy)
         config = self._make_config()
 
         # --- Adaptive padding ---
@@ -665,10 +689,9 @@ class SamplesLoss(torch.nn.Module):
                 )
             config = dataclasses.replace(config, n_orig=n_orig, m_orig=m_orig)
 
-        def _raw_cost(xb, yb, ab, bb, lx, ly,
-                      override_n_orig=None, override_m_orig=None,
-                      xb_unpadded=None, yb_unpadded=None):
-            """Compute raw OT cost via autograd-wrapped Sinkhorn solver."""
+        def _raw_cost(xb, yb, ab, bb, lx, ly, eps_list,
+                      override_n_orig=None, override_m_orig=None):
+            """Compute raw OT cost via autograd-wrapped Sinkhorn solver, on the given epsilon schedule."""
             cfg = config
             if override_n_orig is not None or override_m_orig is not None:
                 cfg = dataclasses.replace(
@@ -676,12 +699,6 @@ class SamplesLoss(torch.nn.Module):
                     n_orig=override_n_orig if override_n_orig is not None else config.n_orig,
                     m_orig=override_m_orig if override_m_orig is not None else config.m_orig,
                 )
-            if _precomputed_eps_list is not None:
-                eps_list = _precomputed_eps_list
-            elif xb_unpadded is not None:
-                eps_list = tuple(self._eps_list_for_inputs(xb_unpadded, yb_unpadded))
-            else:
-                eps_list = tuple(self._eps_list_for_inputs(xb, yb))
             return _SinkhornCostFn.apply(
                 xb, yb, ab, bb,
                 eps_list, cfg,
@@ -699,23 +716,27 @@ class SamplesLoss(torch.nn.Module):
             - OT(x, x): label_x for BOTH source and target
             - OT(y, y): label_y for BOTH source and target
             """
-            cost_xy = _raw_cost(xb, yb, ab, bb, lx_used, ly_used,
-                                xb_unpadded=xb_unpadded, yb_unpadded=yb_unpadded)
+            # One schedule for all three problems, from the unpadded OT(a, b) geometry, as in GeomLoss.
+            if _precomputed_eps_list is not None:
+                eps_list = _precomputed_eps_list
+            elif xb_unpadded is not None:
+                eps_list = tuple(self._eps_list_for_inputs(xb_unpadded, yb_unpadded))
+            else:
+                eps_list = tuple(self._eps_list_for_inputs(xb, yb))
+            cost_xy = _raw_cost(xb, yb, ab, bb, lx_used, ly_used, eps_list)
 
             if not self.debias:
                 return cost_xy
 
             cost_xx = _raw_cost(
-                xb, xb, ab, ab, lx_used, lx_used,
+                xb, xb, ab, ab, lx_used, lx_used, eps_list,
                 override_n_orig=n_orig if should_pad else None,
                 override_m_orig=n_orig if should_pad else None,
-                xb_unpadded=xb_unpadded, yb_unpadded=xb_unpadded,
             )
             cost_yy = _raw_cost(
-                yb, yb, bb, bb, ly_used, ly_used,
+                yb, yb, bb, bb, ly_used, ly_used, eps_list,
                 override_n_orig=m_orig if should_pad else None,
                 override_m_orig=m_orig if should_pad else None,
-                xb_unpadded=yb_unpadded, yb_unpadded=yb_unpadded,
             )
             return cost_xy - 0.5 * cost_xx - 0.5 * cost_yy
 
@@ -724,7 +745,29 @@ class SamplesLoss(torch.nn.Module):
             if self.potentials:
                 f_list = []
                 g_list = []
-                for xb, yb, ab, bb in zip(x, y, a, b):
+                for xb, yb, ab, bb, xb_orig, yb_orig in zip(x, y, a, b, parsed.x, parsed.y):
+                    eps_list_b = self._eps_list_for_inputs(xb_orig, yb_orig)
+                    if self.backend == "alternating":
+                        fb, gb = sinkhorn_flashstyle_alternating(
+                            xb, yb, ab, bb,
+                            eps=float(eps_list_b[-1]),
+                            n_iters=len(eps_list_b),
+                            cost_scale=self.cost_scale,
+                            reach_x=self.reach_x,
+                            reach_y=self.reach_y,
+                            autotune=self.autotune,
+                            allow_tf32=self.allow_tf32,
+                            use_exp2=self.use_exp2,
+                            threshold=self.threshold,
+                            check_every=self.inner_iterations,
+                            n_orig=n_orig if should_pad else None,
+                            m_orig=m_orig if should_pad else None,
+                        )
+                        if should_pad:
+                            fb, gb = _trim_potentials(fb, gb, n_orig, m_orig)
+                        f_list.append(fb)
+                        g_list.append(gb)
+                        continue
                     fb, gb = sinkhorn_flashstyle_symmetric(
                         xb, yb, ab, bb,
                         blur=self.blur,
@@ -732,6 +775,7 @@ class SamplesLoss(torch.nn.Module):
                         use_epsilon_scaling=self.use_epsilon_scaling,
                         eps=self.eps,
                         n_iters=self.n_iters,
+                        eps_list=list(eps_list_b),
                         allow_tf32=self.allow_tf32,
                         use_exp2=self.use_exp2,
                         autotune=self.autotune,
@@ -782,6 +826,8 @@ class SamplesLoss(torch.nn.Module):
                     autotune=self.autotune,
                     allow_tf32=self.allow_tf32,
                     use_exp2=self.use_exp2,
+                    threshold=self.threshold,
+                    check_every=self.inner_iterations,
                     n_orig=n_orig if should_pad else None,
                     m_orig=m_orig if should_pad else None,
                 )
@@ -793,6 +839,7 @@ class SamplesLoss(torch.nn.Module):
                     use_epsilon_scaling=self.use_epsilon_scaling,
                     eps=self.eps,
                     n_iters=self.n_iters,
+                    eps_list=list(eps_list),
                     allow_tf32=self.allow_tf32,
                     use_exp2=self.use_exp2,
                     autotune=self.autotune,

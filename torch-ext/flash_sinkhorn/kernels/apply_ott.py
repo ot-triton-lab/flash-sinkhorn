@@ -515,7 +515,7 @@ def mat5_sqeuclid(
     block_d = max(16, 1 << (int(d) - 1).bit_length())
 
     out = torch.empty((n, d), device=x.device, dtype=torch.float32)
-    scale = -4.0 * cost_scale / eps_f
+    scale = -4.0 * cost_scale**2 / eps_f
 
     if use_autotune:
         def grid(meta):

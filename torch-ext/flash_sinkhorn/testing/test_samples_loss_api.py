@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from flash_sinkhorn import SamplesLoss
+from flash_sinkhorn.samples_loss import _center_coords
 from flash_sinkhorn.hvp import geomloss_to_ott_potentials
 from flash_sinkhorn.hvp import hvp_x_sqeuclid_from_potentials
 from flash_sinkhorn.kernels.sinkhorn_flashstyle_sqeuclid import (
@@ -314,9 +315,11 @@ def test_samplesloss_double_backward_matches_hvp_x_reference():
     hvp_autograd = torch.autograd.grad((grad_x * v).sum(), x)[0]
 
     with torch.no_grad():
+        # SamplesLoss solves on the centred clouds; the reference must see the same coordinates.
+        xc, yc = _center_coords(x.detach(), y, a, b, batched=False)
         _, _, f_grad, g_grad = sinkhorn_flashstyle_symmetric(
-            x.detach(),
-            y,
+            xc,
+            yc,
             a,
             b,
             blur=0.1,
@@ -332,8 +335,8 @@ def test_samplesloss_double_backward_matches_hvp_x_reference():
         )
         f_hat, g_hat = geomloss_to_ott_potentials(f_grad, g_grad, a, b, eps=eps)
         hvp_ref, _ = hvp_x_sqeuclid_from_potentials(
-            x.detach(),
-            y,
+            xc,
+            yc,
             f_hat,
             g_hat,
             v,

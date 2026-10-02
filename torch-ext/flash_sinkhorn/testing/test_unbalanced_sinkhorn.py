@@ -525,7 +525,9 @@ class TestAlternatingUnbalancedParity:
             rho_x=rho,
             rho_y=rho,
         )
-        cost_direct = (a * f).sum() + (b * g).sum()
+        # The fully unbalanced optimal-value expression (GeomLoss convention), as SamplesLoss evaluates it.
+        weight = rho + eps / 2
+        cost_direct = weight * ((a * (1 - (-f / rho).exp())).sum() + (b * (1 - (-g / rho).exp())).sum())
 
         rel_err = abs(cost_autograd.item() - cost_direct.item()) / (
             abs(cost_direct.item()) + 1e-12
