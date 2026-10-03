@@ -284,8 +284,9 @@ grad_x, grad_psi = torch.autograd.grad(loss, [x, psi])
 ```
 
 Differentiable w.r.t. `x` and `psi` (not `y`). Use `cost_scale=0.5` for the
-`||x-y||²/2` (GeomLoss) convention. For the raw streaming kernel, see
-`flash_sinkhorn.kernels.c_transform_kernel`.
+`||x-y||²/2` (GeomLoss) convention. With TF32 (the default) the coordinates are first
+rounded to TF32; pass `allow_tf32=False` for the cells of the points as given. For the raw
+streaming kernel, see `flash_sinkhorn.kernels.c_transform_kernel`.
 
 ## Key Concepts
 

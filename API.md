@@ -652,9 +652,16 @@ grad_x, grad_psi = torch.autograd.grad(loss, [x, psi])
 - Differentiable w.r.t. `x` and `psi` only; `y` must not require grad (raises `NotImplementedError`).
 - Weights `a`, `b` must not require grad.
 - Tie-breaking: smallest-`j` wins across tiles.
+- Precision: with `allow_tf32=True` (the default) the coordinates are rounded to TF32 before
+  both the dot products and the squared norms are computed, so the two describe the same points.
+  FP32 arithmetic error remains and can change the cell of a point whose two best sites are nearly
+  tied. Pass `allow_tf32=False` to keep the coordinates as given. The x gradient uses the original
+  coordinates at the selected cells.
 - Raw kernel: `from flash_sinkhorn.kernels import c_transform_kernel` computes the inner
   `min_j[-2*cost_scale*⟨x_i, y_j⟩ + bias_j]` over a precomputed `bias = cost_scale*||y||² - psi`;
-  `c_transform_fwd` wraps it and adds back `cost_scale*||x_i||²`.
+  `c_transform_fwd` wraps it, rounds the coordinates to TF32 when TF32 is on, and adds back
+  `cost_scale*||x_i||²`. Called directly, the kernel uses the bias as given and does not round the
+  coordinates first; TF32 still applies to its dot products.
 
 ---
 

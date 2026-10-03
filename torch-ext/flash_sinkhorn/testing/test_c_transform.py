@@ -16,6 +16,7 @@ import torch
 import torch.testing
 
 from flash_sinkhorn.c_transform import c_transform_fwd, c_transform_cost
+from flash_sinkhorn.multiscale._preprocess import round_to_tf32
 
 
 # =============================================================================
@@ -266,6 +267,28 @@ def test_tf32_parity():
         assert torch.equal(idx_tf32[safe_mask], idx_notf32[safe_mask]), (
             "TF32 indices differ where gap is large"
         )
+
+
+def test_tf32_matches_float64_on_the_rounded_points():
+    """With TF32 on, compare values and cells with a float64 reference on the TF32-rounded points.
+
+    TF32 dot products combined with squared norms of the unrounded coordinates change cell assignments. Values
+    are checked to FP32 tolerance, cells away from near-ties.
+    """
+    torch.manual_seed(0)
+    side, m = 200, 1000
+    u = (torch.arange(side, device="cuda") + 0.5) / side
+    x = torch.stack(torch.meshgrid(u, u, indexing="ij"), dim=-1).reshape(-1, 2)
+    y = torch.rand(m, 2, device="cuda")
+    psi = 0.01 * torch.rand(m, device="cuda")
+
+    c_values, idx = c_transform_fwd(x, y, psi, cost_scale=0.5, allow_tf32=True)
+
+    vals = 0.5 * torch.cdist(round_to_tf32(x).double(), round_to_tf32(y).double()) ** 2 - psi.double()
+    best, second = vals.topk(2, dim=1, largest=False).values.unbind(dim=1)
+    resolvable = second - best > 1e-6  # leave out near-ties that fp32 cannot order
+    assert torch.equal(idx[resolvable], vals.argmin(dim=1)[resolvable])
+    torch.testing.assert_close(c_values.double(), best, atol=1e-6, rtol=0)
 
 
 # =============================================================================

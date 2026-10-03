@@ -27,6 +27,7 @@ import torch
 
 from .kernels._common import _validate_device
 from .kernels.c_transform_sqeuclid import c_transform_kernel
+from .multiscale._preprocess import round_to_tf32
 
 
 def c_transform_fwd(
@@ -50,7 +51,8 @@ def c_transform_fwd(
         y: Target points [m, d], CUDA
         psi: Dual potential [m], CUDA
         cost_scale: Cost scaling (1.0 for ||x-y||², 0.5 for ||x-y||²/2)
-        allow_tf32: Enable TF32 for matmul
+        allow_tf32: Use TF32 tensor cores. The coordinates are rounded to TF32
+            before both the dot products and the squared norms are computed.
         autotune: Enable kernel autotuning
         **kernel_kwargs: Passed to c_transform_kernel (block_m, block_n, etc.)
 
@@ -89,6 +91,11 @@ def c_transform_fwd(
             "grad_y not supported for c_transform_fwd. "
             "Detach y or use a solver that supports grad_y."
         )
+
+    # Tensor cores round the inputs of each dot product to TF32 while the squared norms below are fp32. Rounding the
+    # coordinates first makes both describe the same points; otherwise nearby sites trade points.
+    if allow_tf32:
+        x, y = round_to_tf32(x), round_to_tf32(y)
 
     # Precompute bias = cost_scale * ||y||² - ψ
     y_f = y.float()
@@ -192,7 +199,8 @@ def c_transform_cost(
 
     where c^ψ(x_i) = min_j [cost_scale * ||x_i - y_j||² - ψ_j].
 
-    Differentiable w.r.t. x and ψ via Danskin's theorem.
+    Differentiable w.r.t. x and ψ via Danskin's theorem, at the selected cells.
+    With TF32 on, the x gradient is that of the unrounded cost at those cells.
     Not differentiable w.r.t. y (raises NotImplementedError if y.requires_grad).
 
     Args:
@@ -200,7 +208,8 @@ def c_transform_cost(
         y: Target points [m, d], CUDA. Must NOT require grad.
         psi: Dual potential [m], CUDA. May require grad.
         cost_scale: Cost scaling (1.0 for ||x-y||², 0.5 for ||x-y||²/2)
-        allow_tf32: Enable TF32 for matmul
+        allow_tf32: Use TF32 tensor cores. The coordinates are rounded to TF32
+            before both the dot products and the squared norms are computed.
         autotune: Enable kernel autotuning
         a: Source weights [n]. Default: uniform 1/n
         b: Target weights [m]. Default: uniform 1/m
