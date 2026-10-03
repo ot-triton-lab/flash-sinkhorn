@@ -42,6 +42,9 @@ dev = [
   "ott-jax",
   "matplotlib",
 ]
+examples = [
+  "matplotlib",
+]
 
 [tool.setuptools]
 include-package-data = true

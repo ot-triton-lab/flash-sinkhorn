@@ -164,6 +164,15 @@ The solve returns once an empirical sampled check finds the marginal residual be
 `info.accepted == False`.
 See [API.md](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/API.md#multiscale-backend-large-3-d-point-clouds) for its options and measured limits.
 
+## Examples
+
+[![Gradient flow of 30,000 particles](https://raw.githubusercontent.com/ot-triton-lab/flash-sinkhorn/main/examples/getting_started/images/gradient_flow.gif)](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/README.md)
+
+Thirteen runnable examples, from 10,000 points to millions, most in about a minute on one GPU: distances, plans and
+gradients; the blur, the GeomLoss and OTT-JAX conventions, unbalanced OT and convergence; the multiscale backend,
+batches and high-dimensional embeddings; Hessian-vector products, semi-discrete transport, labelled datasets and
+attribute transfer. Start from the [examples index](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/README.md).
+
 ## FlashSinkhorn (v0.3.0)
 
 FlashSinkhorn is a reformulated Sinkhorn kernel that uses **shifted potentials** inspired by FlashAttention. It reduces bias vector loads by 67% and elementwise operations by 78% per tile, and improves scalability on OT-based downstream tasks.
