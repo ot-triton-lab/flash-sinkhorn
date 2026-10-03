@@ -85,7 +85,7 @@ factor.
 
 | Backend | Iteration Style | LSE kernel launches/iter | Matches |
 |---------|-----------------|--------------------------|---------|
-| `"symmetric"` (default) | Symmetric | 1 (fused), or 2 for large n | GeomLoss |
+| `"symmetric"` (default) | Symmetric | 1 (fused), or 2 for large n without a label cost | GeomLoss |
 | `"alternating"` | Alternating | 2 | OTT-JAX |
 
 > **Important**: Both backends solve the same OT problem with different update orders. At convergence they give the same plan (balanced potentials up to an additive constant); unconverged iterates differ. Use `backend="symmetric"` for GeomLoss comparisons and `backend="alternating"` for OTT-JAX comparisons.

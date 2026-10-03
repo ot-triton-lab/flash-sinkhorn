@@ -11,7 +11,8 @@ test_unbalanced_reference.py.
   conjugate gradients confirm convergence on the true residual.
 - Clouds shifted far from the origin agree with the centred clouds within tolerance; centering in fp32 keeps the
   tested fp16 and bf16 gaps to fp32 resolution and does not overflow fp16.
-- With a label cost, lambda_x weights the whole feature term.
+- With a label cost, lambda_x weights the whole feature term, and problems above the size where the solver switches
+  to separate kernels still solve.
 - A user eps_list is the schedule that runs.
 """
 
@@ -165,6 +166,20 @@ def test_label_cost_weights_the_whole_feature_term(half_cost, lambda_x):
     expected = (0.5 if half_cost else 1.0) * lambda_x
     assert abs(value.item() - expected) <= 1e-5 * max(1.0, expected)
     assert abs(grad.item() - 2 * expected) <= 1e-5 * max(1.0, 2 * expected)
+
+
+def test_label_cost_solves_above_the_separate_kernel_threshold():
+    # From 30,000 points the solver switches to separate kernels, which have no label cost; with an active label term
+    # it must keep the fused kernel instead of raising. Identical labelled clouds have a zero debiased cost.
+    torch.manual_seed(0)
+    x = torch.rand(30_016, 2, device="cuda")
+    labels = torch.randint(0, 3, (len(x),), device="cuda")
+    W = torch.tensor([[0.0, 1.0, 2.0], [1.0, 0.0, 1.0], [2.0, 1.0, 0.0]], device="cuda")
+    loss = SamplesLoss(blur=0.1, half_cost=True, debias=True, label_cost_matrix=W, lambda_x=1.0, lambda_y=1.0,
+                       autotune=False)
+    value = loss(x, x, label_x=labels, label_y=labels)
+    assert torch.isfinite(value)
+    assert abs(value.item()) < 1e-5
 
 
 def test_conjugate_gradients_confirm_on_the_true_residual():

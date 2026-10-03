@@ -416,9 +416,9 @@ def sinkhorn_flashstyle_symmetric(
         allow_tf32: Enable TF32 for matmul
         use_exp2: Use exp2/log2 optimization
         autotune: Enable kernel autotuning
-        fused: None (default) = auto-select based on n (fused for n < 30000).
+        fused: None (default) = fused when n < 30000 or the label term is active, separate otherwise.
                True = always fused (1 kernel launch per iteration).
-               False = always separate (2 launches per iteration).
+               False = always separate (2 launches per iteration); rejects an active label term.
         threshold: Early stopping threshold
         check_every: Check convergence every N iterations
         return_n_iters: If True, also return number of iterations used
@@ -437,14 +437,14 @@ def sinkhorn_flashstyle_symmetric(
         - Separate: 2 kernel launches per iteration
         - Both produce identical results (symmetric averaging uses old potentials)
         - Fused has 50% fewer kernel launches (better for small n < 30000)
-        - Separate has better memory patterns at large n (auto-switches at n >= 30000)
+        - Separate has better memory patterns at large n (auto-selected at n >= 30000 without an active label term)
 
         Semi-unbalanced OT:
         - Use rho_x, rho_y to set different marginal penalties for source/target
         - rho_x=None, rho_y=float gives strict source constraint, relaxed target
         - damping_f = 1/(1+eps/rho_x), damping_g = 1/(1+eps/rho_y)
 
-        OTDD Label Cost (requires fused=True):
+        OTDD Label Cost (fused kernels only; fused=None selects them at every size when the term is active):
         - label_x: int32/int64 labels for source points [n]
         - label_y: int32/int64 labels for target points [m]
         - label_cost_matrix: W [V, V] matrix of label distances
@@ -529,10 +529,11 @@ def sinkhorn_flashstyle_symmetric(
 
     # Auto-select fused vs separate kernels when fused=None (default).
     # Benchmark on A100-80GB shows separate kernels ~10% faster at n >= 30000.
-    # Explicit fused=True/False overrides the heuristic.
+    # Explicit fused=True/False overrides the heuristic. Only the fused kernel has the label cost, so an active
+    # label term keeps it at any size.
     _FUSE_THRESHOLD = 30000
     if fused is None:
-        fused = n < _FUSE_THRESHOLD
+        fused = n < _FUSE_THRESHOLD or label_active
 
     if fused:
         # =====================================================================
@@ -628,10 +629,9 @@ def sinkhorn_flashstyle_symmetric(
             n_iters_used += 1
 
     else:
-        # Note: SEPARATE PATH does not currently support OTDD label cost
-        # For label cost, use fused=True (default)
+        # The separate path has no label cost: fused=None picks the fused path whenever the term is active.
         if label_x is not None and label_y is not None and label_cost_matrix is not None and lambda_y != 0.0:
-            raise ValueError("OTDD label cost requires fused=True (default). Set fused=True or omit label_cost_matrix.")
+            raise ValueError("An active OTDD label cost needs the fused kernels: use fused=None (default) or True.")
         # =====================================================================
         # SEPARATE PATH: Two kernel launches per iteration
         # Uses flashsinkhorn_lse for each update with manual averaging
