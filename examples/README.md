@@ -1,8 +1,21 @@
-# Examples
+# Tutorials and examples
 
-Runnable scripts at the scale flash-sinkhorn is built for, from 10,000 points to millions, each on one GPU and
-without ever forming the n x m cost matrix. Each script prints its timings, its peak GPU memory and the memory a
-dense float32 matrix would need, and writes the figures shown below.
+Learn how to turn two point clouds into a loss, interpret transport and gradients, and check a result before
+using it. The tutorials explain these ideas with code and figures together. The case gallery then applies
+them to clouds from 10,000 points to millions, on one GPU, using streaming computation.
+
+## Start here
+
+1. [From two point clouds to a differentiable loss](getting_started/first_steps.md): follow one translated cloud
+   through costs, plans, potentials, debiasing, gradients, optimization and a mass-conservation check.
+2. [Choose parameters and check the result](choosing_parameters/guide.md): connect blur, coordinate units,
+   marginal relaxation, convergence and precision to the quantity your application needs.
+3. [Distance, transport and gradient at scale](getting_started/plot_sinkhorn_basics.py): extend the same
+   concepts to a blob and an arc, applying the plan without constructing its full matrix.
+4. Pick an application below: fit a shape, carry an attribute, compare labelled data, or solve at a larger scale.
+
+The first two pages can be read in the browser. Their code and displayed figures are kept together; the
+application scripts print their own numerical results, runtime and memory use and regenerate the gallery figures.
 
 ![Gradient flow of 30,000 particles](getting_started/images/gradient_flow.gif)
 
@@ -11,12 +24,12 @@ pip install -e ".[examples]"     # from a clone of this repository
 python examples/getting_started/plot_sinkhorn_basics.py
 ```
 
-Most examples take about a minute on an A100, the multiscale one a few minutes. Most pass `autotune=False`; the
+Each example reports its runtime on your GPU. Most pass `autotune=False`; the
 batches example compares both settings, and the multiscale backend tunes its own kernels. A first call compiles the
-kernels or loads them from Triton's cache on disk; the basics example says when tuning pays off. The notions themselves (plans,
-potentials, the blur) are taught in the [GeomLoss](https://www.kernel-operations.io/geomloss/_auto_examples/index.html)
-and [OTT-JAX](https://ott-jax.readthedocs.io/) tutorials; these examples show what is specific to flash-sinkhorn:
-conventions, parameters, accuracy and scale.
+kernels or loads them from Triton's cache on disk; the basics example says when tuning pays off. The HVP path
+has its own default tuning behavior. For further OT applications, see the
+[GeomLoss gallery](https://www.kernel-operations.io/geomloss/_auto_examples/index.html) and
+[OTT-JAX tutorials](https://ott-jax.readthedocs.io/tutorials/index.html).
 
 ## Which example?
 

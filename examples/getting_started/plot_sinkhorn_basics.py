@@ -71,8 +71,8 @@ print(f"S_eps(x, y) = {s_eps.item():.5f}, OT_eps(x, y) = {ot_eps.item():.5f}")
 #
 # The plan needs a more careful solve than the loss. The default schedule (``scaling=0.5``) is fast and serves
 # the loss and its gradient, but it stops long before P 1 = a and P'1 = b hold. A slower schedule
-# (``scaling=0.95``) gets much closer, in strict FP32: TF32, the default, rounds the cost, and at a small blur
-# the plan is sensitive to that rounding.
+# (``scaling=0.95``) gets much closer, in strict FP32. Default TF32 rounds the centred coordinates before
+# evaluating costs; reconstructing the plan on the original points can therefore leave a marginal error.
 careful = SamplesLoss(blur=blur, half_cost=True, debias=False, backend="symmetric", potentials=True,
                       scaling=0.95, allow_tf32=False, autotune=False)
 f, g = timed("potentials, scaling=0.95, FP32", lambda: careful(a, x, b, y))

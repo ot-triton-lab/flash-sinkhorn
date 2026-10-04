@@ -9,6 +9,7 @@ semi-unbalanced potentials, zero weights, early stopping, batched potentials and
 from __future__ import annotations
 
 import functools
+import warnings
 
 import pytest
 import torch
@@ -154,22 +155,25 @@ def test_hvp_x(name):
 @pytest.mark.parametrize("name", list(SETTINGS))
 def test_half_cost_scaling(name):
     """Halving the cost, eps and the marginal penalties (reach / sqrt 2) halves the value, the gradient and the
-    Hessian-vector product: every iterate of the solver is exactly half of the full-cost one. The Tikhonov term of the
-    HVP solve does not scale with the cost, so it is made negligible here; at its default 1e-5 it alone moves the
-    balanced HVP by 0.7%. Before the prefactor fix the halved HVP was off by 90x (balanced) and 3.2x (reach)."""
+    Hessian-vector product. The balanced Schur system contains eps * tau2, so double tau2 when halving eps to
+    preserve the regularized system. Stable regularization and confirmed CG convergence keep this a scaling
+    check; nearly zero regularization can make its result depend on the kernel configuration."""
     x, y, a, b = _problem()
     halved = {key: value / 2 ** 0.5 for key, value in SETTINGS[name].items()}
-    common = dict(use_epsilon_scaling=False, n_iters=2000, allow_tf32=False, hvp_tau2=1e-9)
-    losses = (SamplesLoss("sinkhorn", eps=EPS, **common, **SETTINGS[name]),
-              SamplesLoss("sinkhorn", eps=EPS / 2, half_cost=True, **common, **halved))
+    common = dict(use_epsilon_scaling=False, n_iters=2000, allow_tf32=False)
+    losses = (SamplesLoss("sinkhorn", eps=EPS, hvp_tau2=1e-5, **common, **SETTINGS[name]),
+              SamplesLoss("sinkhorn", eps=EPS / 2, half_cost=True, hvp_tau2=2e-5, **common, **halved))
     v = torch.randn(x.shape, generator=torch.Generator().manual_seed(2)).to(x.device)
     out = []
-    for loss in losses:
-        xr = x.clone().requires_grad_(True)
-        cost = loss(a, xr, b, y)
-        (grad,) = torch.autograd.grad(cost, xr, create_graph=True)
-        (hv,) = torch.autograd.grad((grad * v).sum(), xr)
-        out.append((cost.item(), grad.detach(), hv))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for loss in losses:
+            xr = x.clone().requires_grad_(True)
+            cost = loss(a, xr, b, y)
+            (grad,) = torch.autograd.grad(cost, xr, create_graph=True)
+            (hv,) = torch.autograd.grad((grad * v).sum(), xr)
+            out.append((cost.item(), grad.detach(), hv))
+    assert not [w for w in caught if "conjugate gradients" in str(w.message)]
     (c1, g1, h1), (c2, g2, h2) = out
     assert abs(c2 - 0.5 * c1) <= 1e-5 * abs(c1)
     assert (g2 - 0.5 * g1).norm() <= 1e-4 * g1.norm()

@@ -9,6 +9,9 @@ potentials f - cost_scale |x|^2 and g - cost_scale |y|^2 with the log-weights, a
 memory linear in n + m. These helpers do the conversion. The weights a and b must be positive and must be
 the weights the solve used: SamplesLoss normalizes each side to sum to one by default (normalize=True), so
 pass the normalized weights.
+
+These helpers evaluate costs in FP32 on the supplied coordinates. Default TF32 solves round centred coordinates,
+so reconstructing a plan on the original points can differ from the plan on the solved coordinates.
 """
 
 from __future__ import annotations
@@ -55,7 +58,7 @@ def apply_plan_transpose(x, y, f, g, a, b, u, *, eps, cost_scale):
 
 
 def marginals(x, y, f, g, a, b, *, eps, cost_scale):
-    """(P 1, P^T 1). For a converged balanced solve they equal a and b."""
+    """(P 1, P^T 1). For a converged balanced solve using the same costs, they approach a and b."""
     row = apply_plan(x, y, f, g, a, b, torch.ones(len(y), device=y.device), eps=eps, cost_scale=cost_scale)
     col = apply_plan_transpose(x, y, f, g, a, b, torch.ones(len(x), device=x.device), eps=eps,
                                cost_scale=cost_scale)

@@ -44,7 +44,7 @@ cost = loss(a, x, b, y)
 | `scaling` | `float` | `0.5` | Epsilon-scaling factor ∈ (0,1). Closer to 1 = more annealing steps. At small `blur` the default 0.5 can leave the solve far from converged, as in GeomLoss; no value guarantees convergence. |
 | `debias` | `bool` | `False` | Debiased cost OT(x,y) - OT(x,x)/2 - OT(y,y)/2. The symmetric and alternating backends run the three problems on the schedule of OT(x,y), as GeomLoss does; the multiscale backend solves each on its own. With `reach_x != reach_y` it is not a divergence: it need not be symmetric, minimal at x = y, or nonnegative. |
 | `potentials` | `bool` | `False` | If `True`, return the potentials `(f, g)` of OT(x,y) instead of the cost, whatever `debias` says (GeomLoss subtracts the self potentials when `debias=True`). |
-| `normalize` | `bool` | `True` | Normalize weights to sum to 1. |
+| `normalize` | `bool` | `True` | Normalize weights to sum to 1. With `False`, supply probability weights that already sum to 1 on each side: dense costs and weight gradients do not support arbitrary input mass totals. |
 
 #### Unbalanced / Semi-Unbalanced OT
 
@@ -79,7 +79,7 @@ factor.
 |-----------|------|---------|-------------|
 | `backend` | `str` | `"symmetric"` | Backend: `"symmetric"` (GeomLoss-style), `"alternating"` (OTT-JAX-style) or `"multiscale"` (large 3-D point clouds, see below). |
 | `tol` | `float` or `None` | `None` | Target marginal residual `max(‖P1−a‖₁, ‖Pᵀ1−b‖₁)` for `backend="multiscale"` (default `5e-3`); rejected by the other backends. |
-| `autotune` | `bool` | `True` | Enable Triton autotuning for kernel configs. |
+| `autotune` | `bool` | `True` | Enable Triton autotuning for dense forward and first-derivative kernels. The `SamplesLoss` HVP path currently uses its own default tuning. |
 
 **Backend comparison:**
 
@@ -137,14 +137,17 @@ this.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `allow_tf32` | `bool` | `True` | Allow TF32 for the dot products in the cost. Set `False` for strict FP32, for instance to compare with float64 or CPU references. The error of either setting depends on the geometry, `eps`, the conditioning and the iteration count. |
+| `allow_tf32` | `bool` | `True` | Allow TF32 for the dot products in the cost. By default this also enables coordinate rounding through `truncate_tf32`. Set `False` for FP32 dot products and, with `truncate_tf32=None`, unrounded centred coordinates. Multiscale rejects `False`. The error of either setting depends on the geometry, `eps`, conditioning and iteration count. |
+| `truncate_tf32` | `bool` or `None` | `None` | `None` follows `allow_tf32`. The dense backends round centred FP32/FP64 input coordinates to nearest-even TF32 values before padding; fp16/bf16 inputs receive no additional rounding. Gradients and supported HVPs use an identity derivative through rounding. `False` retains unrounded centred coordinates; `True` rounds even with `allow_tf32=False`. Multiscale always rounds, accepts `None`/`True`, and rejects `False`. |
 | `use_exp2` | `bool` | `True` | Compute the log-sum-exp with exp2/log2, as FlashAttention does. |
 
 The symmetric and alternating backends translate both clouds by their joint mass-weighted centroid, in FP32,
 before solving; the multiscale backend preprocesses on its own and the low-level solvers do not. The cost is
 translation invariant, so nothing changes in exact arithmetic, and a common offset no longer enters the FP32 rounding
 of `|x|^2`, which the solvers subtract explicitly. That rounding is relative to `|x|^2`, so clouds spread far from
-their centroid can still lose accuracy at small `eps`.
+their centroid can still lose accuracy at small `eps`. With coordinate rounding enabled, the FP32 norms and TF32
+dot products use the same rounded cloud. Rounding must follow centring because the subtraction produces new FP32
+values. This changes the solved coordinates; FP32 arithmetic error remains.
 
 #### Performance
 
@@ -372,7 +375,7 @@ empirical stopping rule, not a bound) finds `max(‖P1−a‖₁, ‖Pᵀ1−b�
 warns and returns its best candidate with `accepted=False`.
 
 - It solves the **centered, TF32-rounded** clouds at `eps = blur**2`, with its own
-  annealing schedule. `allow_tf32=False`, `use_epsilon_scaling=False`, `eps`, `eps_list`,
+  annealing schedule. `allow_tf32=False`, `truncate_tf32=False`, `use_epsilon_scaling=False`, `eps`, `eps_list`,
   `n_iters`, `diameter`, `threshold`, `pad_to_multiple`, `reach*` and label costs are
   rejected; `scaling`, `last_extrapolation`, `inner_iterations`, `use_exp2`, the kernel
   launch options and the `hvp_*` options do not apply.

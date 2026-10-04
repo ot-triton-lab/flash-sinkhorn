@@ -494,7 +494,7 @@ class TestAlternatingUnbalancedParity:
 
     @pytest.mark.parametrize("reach", [1.0, 2.0, 5.0])
     def test_autograd_vs_direct_cost(self, sample_data, reach):
-        """SamplesLoss (autograd path) must match direct solver cost."""
+        """SamplesLoss must match a direct solve on the same centred, rounded coordinates."""
         x, y, a, b = sample_data
         eps = 0.1
         n_iters = 50
@@ -516,9 +516,14 @@ class TestAlternatingUnbalancedParity:
         from flash_sinkhorn.kernels.sinkhorn_flashstyle_sqeuclid import (
             sinkhorn_flashstyle_alternating,
         )
+        from flash_sinkhorn.multiscale._preprocess import round_to_tf32
+
+        # The low-level solver does not apply SamplesLoss's coordinate preprocessing.
+        mu = ((a[:, None] * x).sum(0) + (b[:, None] * y).sum(0)) / (a.sum() + b.sum())
+        xc, yc = round_to_tf32(x - mu), round_to_tf32(y - mu)
         rho = reach ** 2
         f, g = sinkhorn_flashstyle_alternating(
-            x, y, a, b,
+            xc, yc, a, b,
             eps=eps,
             n_iters=n_iters,
             cost_scale=0.5,

@@ -6,8 +6,8 @@ Choosing the blur at scale
 eps = blur^2 for the squared cost. A smaller blur resolves finer structure and costs more time.
 
 **What you will see:** on 100,000 points, how the displacement field changes with the blur and how the
-entropic bias pulls the points inward unless ``debias=True``; a translated cloud for which the debiased loss is
-exact at every blur; and how the time of a solve grows as the blur shrinks.
+entropic bias pulls the points inward unless ``debias=True``; a translated cloud whose exact debiased loss is
+known at every blur; and how the time of a solve grows as the blur shrinks.
 """
 
 # %%
@@ -74,8 +74,8 @@ save(fig, images_dir(__file__), "blur_maps")
 # --------------------------
 # Translate a cloud by t. For the squared cost the entropic OT cost is then OT_eps(x, x) + |t|^2 / 2, where the
 # entropic bias OT_eps(x, x) grows with the blur. The debiased divergence removes it exactly, so S_eps equals
-# |t|^2 / 2 at every blur. The small constant gap it prints comes from TF32, the default, which rounds the cost;
-# ``allow_tf32=False`` removes most of it.
+# |t|^2 / 2 at every blur. The table compares this identity with the computed loss. Default TF32 rounds the
+# centred coordinates before evaluating costs; ``allow_tf32=False`` avoids that coordinate displacement.
 t = torch.tensor([0.6, 0.3], device=device)
 x2 = torch.rand(n, 2, device=device)
 y2 = x2 + t
@@ -102,8 +102,8 @@ save(fig, images_dir(__file__), "blur_translation")
 # Every halving of the blur lengthens the annealing schedule, which goes from the squared diagonal of the data's
 # bounding box down to blur^2, shrinking eps by a factor scaling^2 per step. Compare the blur with the spacing
 # between points and the size of the data, and with the time a solve takes.
-probe = y[subsample(m, 1000, seed=1, device=device)]
-spacing = torch.cdist(probe, y).topk(2, largest=False).values[:, 1].median().item()
+sampled_y = y[subsample(m, 1000, seed=1, device=device)]
+spacing = torch.cdist(sampled_y, y).topk(2, largest=False).values[:, 1].median().item()
 both = torch.cat([x, y])
 size = (both.max(dim=0).values - both.min(dim=0).values).norm().item()
 print(f"median nearest-neighbour spacing of y: {spacing:.4f}; bounding-box diagonal: {size:.2f}")

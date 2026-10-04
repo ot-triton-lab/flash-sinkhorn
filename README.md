@@ -15,6 +15,8 @@ FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**neve
 
 ## News
 
+- **v0.4.1 (unreleased)**: OT and derivative corrections, consistent TF32 coordinate rounding, and a gallery of
+  runnable examples. See the [release notes](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/CHANGELOG.md).
 - **2026-10** Released [v0.4.0](https://github.com/ot-triton-lab/flash-sinkhorn/releases/tag/v0.4.0): a multiscale backend for large 3-D point clouds (`SamplesLoss(backend="multiscale", tol=...)`).
 - **2026-05** 🎉 FlashSinkhorn accepted to **ICML 2026 as an Oral** (top 0.7%, 168 of ~24k submissions).
 - **2026-04** Released [v0.3.3](https://github.com/ot-triton-lab/flash-sinkhorn/releases/tag/v0.3.3).
@@ -168,10 +170,12 @@ See [API.md](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/API.md#mu
 
 [![Gradient flow of 30,000 particles](https://raw.githubusercontent.com/ot-triton-lab/flash-sinkhorn/main/examples/getting_started/images/gradient_flow.gif)](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/README.md)
 
-Thirteen runnable examples, from 10,000 points to millions, most in about a minute on one GPU: distances, plans and
-gradients; the blur, the GeomLoss and OTT-JAX conventions, unbalanced OT and convergence; the multiscale backend,
-batches and high-dimensional embeddings; Hessian-vector products, semi-discrete transport, labelled datasets and
-attribute transfer. Start from the [examples index](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/README.md).
+Start with [From two point clouds to a differentiable loss](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/getting_started/first_steps.md),
+then [Choose parameters and check the result](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/choosing_parameters/guide.md).
+These tutorials explain the concepts with code and figures together. The
+[case gallery](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/README.md) contains thirteen runnable
+examples, from 10,000 points to millions: gradient flows, transport and attribute transfer, relaxed marginals,
+labelled datasets, embeddings, batches, multiscale solves, Hessian-vector products and semi-discrete transport.
 
 ## FlashSinkhorn (v0.3.0)
 
@@ -316,7 +320,12 @@ FlashSinkhorn streams tiles of (x,y) and computes costs on-the-fly:
 
 - Online log-sum-exp with a running maximum, in exp2/log2
 - Safe log/division guards against underflow
-- TF32 enabled by default for the cost dot products (set `allow_tf32=False` for strict FP32; the multiscale backend rejects it)
+- TF32 is enabled by default for cost dot products. `truncate_tf32=None` follows `allow_tf32`: dense backends
+  round centred FP32/FP64 input coordinates to TF32 before padding, with an identity derivative for gradients and
+  supported HVPs; fp16/bf16 inputs receive no additional rounding. Norms and dot products then use the same rounded
+  cloud, with FP32 arithmetic error remaining. Set `truncate_tf32=False` to keep unrounded centred coordinates,
+  or `allow_tf32=False` for FP32 dot products and no default rounding. Multiscale always rounds and rejects either
+  option set to `False`.
 - HVP (double backward) uses strict FP32 internally for numerical stability
 
 ## Benchmarks

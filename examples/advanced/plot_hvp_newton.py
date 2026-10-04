@@ -108,9 +108,9 @@ print(f"the same with the default schedule: {show(eigenvalues(hessian(default, t
 # Gradient descent with the step 1 / lambda_max; the same with a step above 2 / lambda_max, which diverges; and ten
 # gradient steps followed by Newton steps theta <- theta - H^-1 grad. After ten steps the smallest eigenvalue is
 # well away from zero, and Newton's method converges in a few steps, each with a fresh Hessian (six Hessian-vector
-# products). The last run repeats it with the default schedule. Every run is scored with the careful solve; the
-# loss gaps level off around 1e-8, so the plot stops there. A is not recovered exactly, because the loss is not
-# debiased and z and y are different samples.
+# products). The last run repeats it with the default schedule and TF32 precision. Every run is scored with the
+# careful solve; the plot clips the smallest loss gaps to keep the optimization progress visible. A is not recovered
+# exactly, because the loss is not debiased and z and y are different samples.
 
 
 def gradient_step(scale):

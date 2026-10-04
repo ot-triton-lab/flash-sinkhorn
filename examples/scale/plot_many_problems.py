@@ -47,8 +47,8 @@ print(f"values of shape {tuple(batched.shape)}; largest difference between the t
 # -----------------------------
 # With ``autotune=True`` (the default), the first call for a new size bucket (key n // 32; here the first four calls
 # meet new buckets) benchmarks kernel configurations, compiling those not yet in the cache; later calls in that
-# bucket reuse the choice, within the same process. With ``autotune=False`` no call is tuned, and warm calls are
-# somewhat slower. If new size buckets keep appearing, turn tuning off.
+# bucket reuse the choice, within the same process. With ``autotune=False`` no call is tuned; compare the warm
+# calls to judge the benefit on these sizes. If new size buckets keep appearing, turn tuning off.
 # ``pad_to_multiple=k`` pads every cloud to a multiple of k with zero-weight points, so that fewer distinct sizes
 # reach the tuner, at the cost of the padded points; measure it on your sizes before relying on it.
 sizes = [10_000, 13_000, 17_000, 22_000] * 2

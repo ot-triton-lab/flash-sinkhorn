@@ -67,8 +67,9 @@ for tf32 in (False, True):
 # ---------------------
 # Two ways to spend iterations: a fixed eps from the start (``use_epsilon_scaling=False``, ``n_iters``), or
 # annealing eps from the size of the data down to blur^2, faster or slower (``scaling``). Each point is one solve.
-# At a small blur, annealing reaches a given residual far sooner. TF32, the default, rounds the cost, so its
-# residual stops falling at a floor that FP32 does not have.
+# At a small blur, annealing reaches a given residual far sooner. The residual below uses FP32 costs on the
+# original points. Default TF32 rounds centred coordinates for the solve, so that displacement can limit this
+# residual even after the solve has converged.
 curves = {}
 for precision, tf32 in (("FP32", False), ("TF32", True)):
     fixed = []

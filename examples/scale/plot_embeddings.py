@@ -6,8 +6,8 @@ High-dimensional embeddings
 compare two sets of embeddings or to match one set to another.
 
 **What you will see:** 50,000 embeddings in 768 dimensions and a perturbed copy of them; the memory against the
-dense matrix; why the cost must be computed in FP32 at a small blur; whether the plan pairs each embedding with
-its own copy as the blur shrinks; and how mass moves between the classes of the embeddings.
+dense matrix; how precision affects the plan on the original coordinates; whether the plan pairs each embedding
+with its own copy as the blur shrinks; and how mass moves between the classes of the embeddings.
 """
 
 # %%
@@ -41,21 +41,22 @@ x = centers[labels] + torch.randn(n, d, device=device)
 y = x + 0.3 * torch.randn(n, d, device=device)
 a = torch.full((n,), 1.0 / n, device=device)
 print(dense_size(n, n))
-probe = subsample(n, 2000, device=device)
-distances = torch.cdist(x[probe], y[probe])
-same = labels[probe][:, None] == labels[probe][None, :]
+sample_indices = subsample(n, 2000, device=device)
+distances = torch.cdist(x[sample_indices], y[sample_indices])
+same = labels[sample_indices][:, None] == labels[sample_indices][None, :]
 print(f"median distance to the own copy {distances.diag().median().item():.1f}, within a class "
       f"{distances[same].median().item():.1f}, across classes {distances[~same].median().item():.1f}")
 
 # %%
-# The cost needs FP32 here
-# ------------------------
-# In 768 dimensions the squared norms are large. TF32, the default, rounds the inputs of the dot products in the
-# cost, and at a small eps the plan amplifies that error: rebuilt with FP32 costs, the TF32 potentials give wrong
-# marginals, and the total mass on the matching copies can exceed one. ``allow_tf32=False`` brings the residuals
-# down. For each blur and precision: the marginal residual and the total mass on the matching copies (one for an
-# exact pairing). At blur 10, between the two regimes, the default schedule leaves a larger residual than at the
-# other two blurs, even in FP32. The first solve of each precision is timed.
+# Precision and the original coordinates
+# ---------------------------------------
+# Default TF32 rounds the centred coordinates before computing squared norms and dot products. The checks below
+# rebuild the plan using FP32 costs on the original embeddings, so their residual includes effects of that
+# displacement as well as incomplete convergence. ``allow_tf32=False`` keeps the solve and the reconstruction on
+# the same coordinates when an accurate plan is needed. For each blur and precision: the marginal residual and
+# the total mass on the matching copies (one for an exact pairing). At blur 10, between the two regimes, the default
+# schedule leaves a larger residual than at the other two blurs, even in FP32. The first solve of each precision
+# is timed.
 own_cost = 0.5 * (x - y).pow(2).sum(dim=1)
 blurs = [30.0, 10.0, 3.0]
 own_mass, residuals = {}, {}

@@ -62,6 +62,21 @@ def _center_coords(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.T
     return x.float() - mu, y.float() - mu
 
 
+def _round_to_tf32(t: torch.Tensor) -> torch.Tensor:
+    """Round to nearest-even TF32 values with an identity autograd derivative.
+
+    Run after centring: subtracting the centroid produces new FP32 values.
+    Rounding makes the FP32 norms and TF32 dot products use the same coordinates;
+    FP32 arithmetic error remains. The detached displacement preserves first
+    derivatives and double backward. fp16/bf16 tensors need no further rounding.
+    """
+    from .multiscale._preprocess import round_to_tf32
+
+    if t.dtype not in (torch.float32, torch.float64):
+        return t
+    return t + (round_to_tf32(t) - t).detach()
+
+
 def _as_float_tensor(x: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(x):
         raise TypeError("Expected a torch.Tensor.")
@@ -333,6 +348,17 @@ class SamplesLoss(torch.nn.Module):
 
     Notes
     -----
+    - Dense costs and weight gradients assume probability weights on each side.
+      With ``normalize=False``, supply weights that already sum to one; arbitrary
+      input mass totals are not supported for these outputs.
+    - ``allow_tf32=True`` enables TF32 cost dot products. ``truncate_tf32=None``
+      follows ``allow_tf32``: the dense backends round centred FP32/FP64 input
+      coordinates to nearest-even TF32 values before padding, so the norms and
+      dot products describe the same rounded cloud. FP32 arithmetic error remains.
+      fp16/bf16 inputs receive no additional rounding. Rounding uses an identity
+      derivative for gradients and supported HVPs. Set ``truncate_tf32=False`` to
+      retain unrounded centred coordinates, or ``True`` to round even with FP32
+      dot products. Multiscale always rounds and rejects ``truncate_tf32=False``.
     - Gradients are computed analytically (no backprop through Sinkhorn iterations),
       matching GeomLoss's `last_extrapolation` convention.
     - `potentials=True` returns (f, g) without autograd support.
@@ -355,6 +381,7 @@ class SamplesLoss(torch.nn.Module):
         use_epsilon_scaling: bool = True,
         last_extrapolation: bool = True,
         allow_tf32: bool = True,
+        truncate_tf32: Optional[bool] = None,
         use_exp2: bool = True,
         autotune: bool = True,
         half_cost: bool = False,
@@ -430,6 +457,7 @@ class SamplesLoss(torch.nn.Module):
                     'backend="alternating" does not support OTDD label cost. '
                     'Use backend="symmetric" for label-augmented cost.'
                 )
+        truncate_tf32 = bool(allow_tf32) if truncate_tf32 is None else bool(truncate_tf32)
         if backend == "multiscale":
             unsupported = dict(reach=reach, reach_x=reach_x, reach_y=reach_y,
                                label_cost_matrix=label_cost_matrix, threshold=threshold, eps=eps,
@@ -437,10 +465,12 @@ class SamplesLoss(torch.nn.Module):
                                pad_to_multiple=pad_to_multiple)
             given = [name for name, value in unsupported.items() if value is not None]
             given += [name for name, value in (("allow_tf32=False", allow_tf32),
+                                               ("truncate_tf32=False", truncate_tf32),
                                                ("use_epsilon_scaling=False", use_epsilon_scaling))
                       if not value]
             if given:
-                raise ValueError(f'backend="multiscale" does not support {", ".join(given)}.')
+                raise ValueError(f'backend="multiscale" does not support {", ".join(given)}. '
+                                 'It always rounds centered coordinates to TF32.')
             tol = MULTISCALE_DEFAULT_TOL if tol is None else float(tol)
             if not 0.0 < tol <= 1.0:
                 raise ValueError("tol must be in (0, 1].")
@@ -485,6 +515,7 @@ class SamplesLoss(torch.nn.Module):
         self.use_epsilon_scaling = bool(use_epsilon_scaling)
         self.last_extrapolation = bool(last_extrapolation)
         self.allow_tf32 = bool(allow_tf32)
+        self.truncate_tf32 = truncate_tf32
         self.use_exp2 = bool(use_exp2)
         self.autotune = bool(autotune)
         self.half_cost = bool(half_cost)
@@ -649,6 +680,12 @@ class SamplesLoss(torch.nn.Module):
             return self._forward_multiscale(parsed, label_x, label_y)
 
         cx, cy = _center_coords(parsed.x, parsed.y, parsed.a, parsed.b, batched=parsed.batched)
+        if self.truncate_tf32:
+            # Centring promotes every dtype to FP32; preserve the input's precision policy per side.
+            if parsed.x.dtype in (torch.float32, torch.float64):
+                cx = _round_to_tf32(cx)
+            if parsed.y.dtype in (torch.float32, torch.float64):
+                cy = _round_to_tf32(cy)
         parsed = dataclasses.replace(parsed, x=cx, y=cy)
         config = self._make_config()
 
