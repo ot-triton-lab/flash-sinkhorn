@@ -73,12 +73,6 @@ def test_index_key_calls_name_real_parameters():
         assert called, code
 
 
-def test_index_chart_is_a_plain_mermaid_flowchart():
-    block = re.search(r"```mermaid\n(.*?)```", INDEX.read_text(), re.S).group(1)
-    assert block.startswith("flowchart")
-    assert "click " not in block
-
-
 RAW = "https://raw.githubusercontent.com/ot-triton-lab/flash-sinkhorn/main/"
 
 

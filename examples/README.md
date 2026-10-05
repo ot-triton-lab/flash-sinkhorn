@@ -38,27 +38,6 @@ has its own default tuning behavior. For further OT applications, see the
 [GeomLoss gallery](https://www.kernel-operations.io/geomloss/_auto_examples/index.html) and
 [OTT-JAX tutorials](https://ott-jax.readthedocs.io/tutorials/index.html).
 
-## Which example?
-
-```mermaid
-flowchart TD
-    start["Your data"] --> labelled{"Two labelled datasets?"}
-    labelled -->|yes| otdd["Comparing labelled datasets"]
-    labelled -->|no| sites{"A dense sample against a set of sites?"}
-    sites -->|yes| semi["Semi-discrete transport"]
-    sites -->|no| big{"Millions of 3-D points, for a balanced OT value or potentials?"}
-    big -->|yes| multiscale["Millions of 3-D points: the multiscale backend"]
-    big -->|no| need{"What do you need?"}
-    need -->|a distance or a gradient| basics["Distance, transport and gradient, then Choosing the blur"]
-    need -->|to fit one cloud to another| flow["Gradient flows"]
-    need -->|where the mass goes| plans["Distance, transport and gradient, then Carrying colours and labels"]
-    need -->|curvature or Newton steps| hvp["Curvature from Hessian-vector products"]
-```
-
-Whatever the task, three questions come back: do the numbers match GeomLoss or OTT-JAX (Matching GeomLoss and
-OTT-JAX), do outliers distort the result (Outliers and missing mass), and is it converged (Is it converged?). Many
-problems of changing size and high-dimensional features each have their own example under Scale.
-
 ## Situations
 
 Each `SamplesLoss` key call states `half_cost` and `debias`, whose defaults (`False`) differ from GeomLoss's;
