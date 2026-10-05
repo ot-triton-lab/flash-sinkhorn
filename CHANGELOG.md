@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.1 — unreleased
+## 0.4.1
 
 - Correct unbalanced and semi-unbalanced OT values and derivatives, including half-cost scaling and convergence
   reporting. Centre dense inputs in FP32 to reduce sensitivity to a common coordinate offset.
@@ -20,4 +20,5 @@
 Dense costs and weight gradients assume probability input weights. With `normalize=False`, each input measure
 must already sum to one; arbitrary input mass totals remain unsupported for these outputs.
 
-These notes describe the local release candidate. Version 0.4.1 has not been published.
+Version 0.4.1 is available on [PyPI](https://pypi.org/project/flash-sinkhorn/0.4.1/), GitHub `main`, and the
+[Hugging Face Kernels Hub](https://huggingface.co/kernels/yexf308/flash-sinkhorn/tree/v1).

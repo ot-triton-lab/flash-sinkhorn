@@ -13,11 +13,11 @@ describes transport, and why those outputs need different accuracy checks.
 
 ## Run the lesson
 
-You need an NVIDIA CUDA GPU and a clone of this repository. From the repository root, install the package and
-plotting dependencies:
+You need an NVIDIA CUDA GPU and a clone of this repository for the example files. Install the released package
+and plotting dependencies:
 
 ```bash
-pip install -e ".[examples]"
+pip install --upgrade "flash-sinkhorn[examples]"
 ```
 
 Run the Python blocks below in order, in one Python session or notebook started from the repository root.

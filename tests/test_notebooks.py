@@ -201,18 +201,21 @@ def test_real_kernel_displays_fresh_png_and_gif_and_can_run_twice(converter, tmp
 
 
 @pytest.mark.parametrize("name", ["plot_sinkhorn_basics.py", "first_steps.md"])
-def test_notebook_setup_imports_this_checkout_then_reports_missing_cuda(converter, name):
+def test_notebook_setup_uses_installed_package_then_reports_missing_cuda(converter, name, tmp_path):
     nbformat = pytest.importorskip("nbformat")
     nbclient = pytest.importorskip("nbclient")
     source = ROOT / "examples/getting_started" / name
+    installed = tmp_path / "site-packages"
+    shutil.copytree(ROOT / "torch-ext/flash_sinkhorn", installed / "flash_sinkhorn",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     notebook = nbformat.reads(json.dumps(converter.make_notebook(source, ROOT)), as_version=4)
     code = [cell for cell in notebook.cells if cell.cell_type == "code"]
     notebook.cells = code[:2]
     notebook.cells.insert(1, nbformat.v4.new_code_cell(
         "import flash_sinkhorn\n"
-        "assert Path(flash_sinkhorn.__file__).resolve().is_relative_to(_notebook_root / 'torch-ext')"
+        f"assert Path(flash_sinkhorn.__file__).resolve().is_relative_to(Path({str(installed)!r}))"
     ))
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(installed))
     client = nbclient.NotebookClient(notebook, timeout=90, kernel_name="python3", allow_errors=True)
     client.execute(cwd=str(source.parent), env=env)
     errors = [out for cell in notebook.cells for out in cell.get("outputs", []) if out.output_type == "error"]
@@ -227,7 +230,7 @@ def test_index_offers_all_notebooks_and_keeps_script_links():
         assert f"]({relative.with_suffix('.ipynb').as_posix()})" in index
         if source.suffix == ".py":
             assert f"]({relative.as_posix()})" in index
-    assert '.[notebooks]' in index
+    assert 'flash-sinkhorn[notebooks]' in index
     assert sorted((ROOT / "examples").glob("*/*.ipynb")) == sorted(s.with_suffix(".ipynb") for s in SOURCES)
 
 

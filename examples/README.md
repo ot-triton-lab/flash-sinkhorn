@@ -27,9 +27,14 @@ the scripts.
 ![Gradient flow of 30,000 particles](getting_started/images/gradient_flow.gif)
 
 ```bash
-pip install -e ".[notebooks]"    # from a clone of this repository
+pip install --upgrade "flash-sinkhorn[notebooks]"
+git clone https://github.com/ot-triton-lab/flash-sinkhorn.git
+cd flash-sinkhorn
 jupyter lab examples/getting_started/first_steps.ipynb
 ```
+
+The checkout supplies the example files and plotting helpers. The solver comes from the installed package;
+use `pip install --upgrade flash-sinkhorn` to update it.
 
 Each example reports its runtime on your GPU. Most pass `autotune=False`; the
 batches example compares both settings, and the multiscale backend tunes its own kernels. A first call compiles the
@@ -82,7 +87,7 @@ kernels' convention.
 
 ## Running scripts and maintaining notebooks
 
-For command-line execution without Jupyter, install `pip install -e ".[examples]"` and run, for example,
+For command-line execution without Jupyter, install `pip install --upgrade "flash-sinkhorn[examples]"` and run, for example,
 `python examples/getting_started/plot_sinkhorn_basics.py`. Both forms use the same numerical code.
 
 The `.py` scripts and the Markdown lessons

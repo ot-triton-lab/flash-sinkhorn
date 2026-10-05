@@ -8,6 +8,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/flash-sinkhorn)](https://pypi.org/project/flash-sinkhorn/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Hugging Face Kernels](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Kernels%20Hub-ffb000)](https://huggingface.co/kernels/yexf308/flash-sinkhorn)
+[![Kernel build](https://github.com/ot-triton-lab/flash-sinkhorn/actions/workflows/build-kernel.yml/badge.svg?branch=main)](https://github.com/ot-triton-lab/flash-sinkhorn/actions/workflows/build-kernel.yml)
 
 **Streaming Entropic Optimal Transport in PyTorch + Triton**
 
@@ -15,8 +16,11 @@ FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**neve
 
 ## News
 
-- **v0.4.1 (unreleased)**: OT and derivative corrections, consistent TF32 coordinate rounding, and a gallery of
-  runnable examples. See the [release notes](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/CHANGELOG.md).
+- **v0.4.1**: OT and derivative corrections, consistent TF32 coordinate rounding,
+  and 15 Jupyter notebooks covering introductory lessons and applications. Available on
+  [PyPI](https://pypi.org/project/flash-sinkhorn/0.4.1/) and the
+  [Kernels Hub](https://huggingface.co/kernels/yexf308/flash-sinkhorn/tree/v1).
+  See the [release notes](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/CHANGELOG.md).
 - **2026-10** Released [v0.4.0](https://github.com/ot-triton-lab/flash-sinkhorn/releases/tag/v0.4.0): a multiscale backend for large 3-D point clouds (`SamplesLoss(backend="multiscale", tol=...)`).
 - **2026-05** 🎉 FlashSinkhorn accepted to **ICML 2026 as an Oral** (top 0.7%, 168 of ~24k submissions).
 - **2026-04** Released [v0.3.3](https://github.com/ot-triton-lab/flash-sinkhorn/releases/tag/v0.3.3).
@@ -39,19 +43,27 @@ FlashSinkhorn computes Sinkhorn OT using FlashAttention-style streaming—**neve
 
 ## Install
 
-```bash
-pip install flash-sinkhorn
+Install or upgrade to **v0.4.1** from [PyPI](https://pypi.org/project/flash-sinkhorn/):
 
-# From source (development)
-pip install -e ".[dev]"
+```bash
+pip install --upgrade flash-sinkhorn
 ```
 
-**Requirements:** PyTorch ≥2.5, Triton ≥3.1, CUDA 12.x
+To run the tutorials, install the notebook dependencies and clone the example files:
 
-Prefer not to install the package? FlashSinkhorn is also published on the
-[Hugging Face Kernels Hub](https://huggingface.co/kernels/yexf308/flash-sinkhorn)
-and can be loaded on the fly with `kernels.get_kernel` — no cloning or
-`pip install` required. See [Hugging Face Kernels Hub](#hugging-face-kernels-hub) below.
+```bash
+pip install --upgrade "flash-sinkhorn[notebooks]"
+git clone https://github.com/ot-triton-lab/flash-sinkhorn.git
+cd flash-sinkhorn
+jupyter lab examples/getting_started/first_steps.ipynb
+```
+
+For the plotting scripts, use `pip install --upgrade "flash-sinkhorn[examples]"`.
+The examples use the installed package, which can be upgraded through pip.
+**Requirements:** Python ≥3.9, PyTorch ≥2.5, Triton ≥3.1, CUDA 12.x.
+
+The [Hugging Face Kernels Hub](#hugging-face-kernels-hub) also serves v0.4.1. Its `kernels` client downloads
+the package on first use.
 
 ## Quick Start
 
@@ -79,7 +91,7 @@ cost = loss(x, y)
 grad_x = torch.autograd.grad(cost, x)[0]  # Analytic gradient
 ```
 
-### GeomLoss Parity
+### Matching GeomLoss Conventions
 
 Use `half_cost=True` to match GeomLoss's cost convention:
 
@@ -87,9 +99,13 @@ Use `half_cost=True` to match GeomLoss's cost convention:
 # FlashSinkhorn with GeomLoss's squared-Euclidean cost convention
 flash_loss = SamplesLoss(loss="sinkhorn", blur=0.1, half_cost=True, debias=True)
 
-# Equivalent GeomLoss call
+# GeomLoss with the same pair-cost and debiasing conventions
 # geomloss_loss = geomloss.SamplesLoss(loss="sinkhorn", p=2, blur=0.1, debias=True)
 ```
+
+Iteration schedules and arithmetic precision can still produce numerical differences. See the
+[conventions notebook](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/choosing_parameters/plot_conventions.ipynb)
+for a controlled comparison.
 
 ### Unbalanced OT
 
@@ -138,7 +154,7 @@ x = torch.randn(4096, 64, device="cuda", requires_grad=True)
 y = torch.randn(4096, 64, device="cuda")
 v = torch.randn_like(x)
 
-loss = SamplesLoss(loss="sinkhorn", blur=0.1)
+loss = SamplesLoss(loss="sinkhorn", blur=0.1, debias=False)
 cost = loss(x, y)
 
 # First-order gradient
@@ -147,6 +163,10 @@ grad_x = torch.autograd.grad(cost, x, create_graph=True)[0]
 # HVP via double backward (uses streaming CG solver)
 hvp = torch.autograd.grad((grad_x * v).sum(), x)[0]
 ```
+
+Double backward currently supports derivatives with respect to `x` with `debias=False`, no gradient on `y`,
+and no label cost. See the [HVP notebook](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/advanced/plot_hvp_newton.ipynb)
+for convergence checks and an optimization example.
 
 ### Large 3-D Point Clouds (Multiscale Backend)
 
@@ -172,13 +192,18 @@ See [API.md](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/API.md#mu
 
 Start with [From two point clouds to a differentiable loss](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/getting_started/first_steps.ipynb),
 then [Choose parameters and check the result](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/choosing_parameters/guide.ipynb).
-These Jupyter notebooks explain the concepts with code and reference figures together. Install
-`pip install -e ".[notebooks]"` from a clone and open `jupyter lab` to run the code cells on a CUDA GPU. The
+The gallery contains **15 notebooks**: one executable introductory lesson, one parameter guide, and thirteen
+applications. They combine explanations, code and labelled reference figures. Install
+`pip install --upgrade "flash-sinkhorn[notebooks]"`, clone the example files, and open `jupyter lab`
+to run the code cells on a CUDA GPU. The
 [case gallery](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/README.md) contains thirteen runnable
 examples, from 10,000 points to millions: gradient flows, transport and attribute transfer, relaxed marginals,
 labelled datasets, embeddings, batches, multiscale solves, Hessian-vector products and semi-discrete transport.
 
-## FlashSinkhorn (v0.3.0)
+Reference figures come from previous script runs. Running the code cells produces fresh output and figures.
+Each application also provides a `.py` script; notebooks are generated from the same sources.
+
+## Kernel Design
 
 FlashSinkhorn is a reformulated Sinkhorn kernel that uses **shifted potentials** inspired by FlashAttention. It reduces bias vector loads by 67% and elementwise operations by 78% per tile, and improves scalability on OT-based downstream tasks.
 
@@ -186,7 +211,10 @@ FlashSinkhorn is a reformulated Sinkhorn kernel that uses **shifted potentials**
 
 Standard Sinkhorn loads 3 bias vectors per tile (g, log_b, y²). FlashSinkhorn precomputes a single fused bias `u = (g_shifted + eps*log(b)) / eps` and uses raw coordinates with an inline scale factor, matching FlashAttention's score interface exactly.
 
-### Performance (d=64, A100-80GB, 100 iterations)
+### Earlier Benchmarks (v0.3.0, d=64, A100-80GB, 100 iterations)
+
+These measurements compare v0.3.0 with v0.2.0. To measure the current version on your hardware, use the
+[benchmark commands](#benchmarks).
 
 **Symmetric solver (vs v0.2.0 GeomLoss-style kernel):**
 
@@ -240,6 +268,9 @@ SamplesLoss(
     inner_iterations=10,      # Check convergence every N iters
     backend="symmetric",      # "symmetric", "alternating" or "multiscale"
     tol=None,                 # Multiscale only: target marginal residual (default 5e-3)
+    allow_tf32=True,           # TF32 cost dot products
+    truncate_tf32=None,        # Round centred coordinates; None follows allow_tf32
+    autotune=True,             # Tune dense forward/first-derivative kernels on first use
 )
 ```
 
@@ -357,19 +388,12 @@ Results are saved to `output/paper_benchmarks/forward/` and `output/paper_benchm
 
 ## Hugging Face Kernels Hub
 
-FlashSinkhorn can be loaded as a JIT-compiled Triton kernel from the Hugging
-Face Kernels Hub. To build and publish the configured kernel project, install
-the [kernel builder](https://huggingface.co/docs/kernels/builder/build) and run:
+The [Hub v1 package](https://huggingface.co/kernels/yexf308/flash-sinkhorn/tree/v1) contains FlashSinkhorn
+**0.4.1**. Install the client, then load the kernel:
 
 ```bash
-kernel-builder check-config
-kernel-builder build-and-copy -L
-kernel-builder build-and-upload
+pip install kernels
 ```
-
-The build configuration publishes version 1 to
-[`yexf308/flash-sinkhorn`](https://huggingface.co/kernels/yexf308/flash-sinkhorn).
-Consumers can load it without cloning this repository:
 
 ```python
 from kernels import get_kernel
@@ -377,6 +401,15 @@ from kernels import get_kernel
 flash_sinkhorn = get_kernel("yexf308/flash-sinkhorn", version=1)
 loss = flash_sinkhorn.SamplesLoss(loss="sinkhorn", blur=0.1, debias=True)
 ```
+
+`version=1` selects the Hub kernel API version; it is separate from the Python package version `0.4.1`.
+The kernel runs on CUDA tensors and needs the same PyTorch and Triton dependencies as the source package.
+
+Builds and uploads use the [GitHub Actions workflow](https://github.com/ot-triton-lab/flash-sinkhorn/actions/workflows/build-kernel.yml).
+For local builds, use the builder revision pinned in
+[`flake.nix`](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/flake.nix) and
+[the workflow](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/.github/workflows/build-kernel.yml),
+following the [kernel-builder instructions](https://huggingface.co/docs/kernels/builder/build).
 
 ## Citation
 

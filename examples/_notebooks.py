@@ -99,7 +99,8 @@ else:
     raise RuntimeError("Start Jupyter inside the flash-sinkhorn repository checkout.")
 
 os.chdir(_notebook_root)
-for _path in reversed([_notebook_root / "torch-ext", _notebook_root / "examples", _notebook_root]):
+# Locate shared example helpers; import the solver from the installed package.
+for _path in reversed([_notebook_root / "examples", _notebook_root]):
     if str(_path) in sys.path:
         sys.path.remove(str(_path))
     sys.path.insert(0, str(_path))
@@ -181,9 +182,11 @@ def make_notebook(source: Path, root: Path = ROOT) -> dict:
     )
     if runnable:
         instructions += (
-            "\n\nFrom a repository checkout, install `pip install -e '.[notebooks]'` and start `jupyter lab`. "
+            "\n\nInstall `pip install --upgrade 'flash-sinkhorn[notebooks]'`, clone this repository for the "
+            "example files, and start `jupyter lab` from the checkout. "
             "Select its Python environment, then run the cells in order on an NVIDIA CUDA GPU. "
             "The setup cell finds the checkout from the repository root or this notebook's folder. "
+            "The solver comes from the installed package. "
             "Running all cells prints fresh results and displays new figures; it also replaces the "
             "source's saved images. The scale examples retain the script's full problem sizes."
         )
