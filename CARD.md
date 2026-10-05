@@ -11,7 +11,8 @@ tags:
 
 FlashSinkhorn provides streaming entropic optimal-transport kernels for PyTorch
 and Triton. It computes squared-Euclidean Sinkhorn losses without materializing
-the full cost matrix.
+the full cost matrix. FlashSinkhorn 2 provides its multiscale, block-sparse method
+for large balanced 3-D point clouds, with forward costs and potentials.
 
 Source code, documentation, and issues live in the GitHub repository:
 [ot-triton-lab/flash-sinkhorn](https://github.com/ot-triton-lab/flash-sinkhorn).
@@ -30,4 +31,5 @@ The input tensors must be CUDA tensors and require PyTorch and Triton.
 ## Links
 
 - **GitHub repository:** https://github.com/ot-triton-lab/flash-sinkhorn
-- **Paper:** https://arxiv.org/abs/2602.03067 (FlashSinkhorn, ICML 2026 Oral)
+- **FlashSinkhorn:** https://arxiv.org/abs/2602.03067 (dense streaming kernels, ICML 2026 Oral)
+- **FlashSinkhorn 2:** https://arxiv.org/abs/2610.02395 (multiscale method)
