@@ -45,6 +45,11 @@ dev = [
 examples = [
   "matplotlib",
 ]
+notebooks = [
+  "matplotlib",
+  "jupyterlab",
+  "nbclient",
+]
 
 [tool.setuptools]
 include-package-data = true

@@ -14,6 +14,8 @@
   are active.
 - Update the API documentation and add 13 runnable examples covering costs, gradients, parameter choices,
   convergence, large point clouds, embeddings, label costs, Hessian-vector products, and semi-dual transport.
+- Provide Jupyter notebooks for all 13 examples and two introductory lessons, with reference figures,
+  per-section code cells, and a generator that keeps them synchronized with their Python and Markdown sources.
 
 Dense costs and weight gradients assume probability input weights. With `normalize=False`, each input measure
 must already sum to one; arbitrary input mass totals remain unsupported for these outputs.

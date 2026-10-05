@@ -170,9 +170,10 @@ See [API.md](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/API.md#mu
 
 [![Gradient flow of 30,000 particles](https://raw.githubusercontent.com/ot-triton-lab/flash-sinkhorn/main/examples/getting_started/images/gradient_flow.gif)](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/README.md)
 
-Start with [From two point clouds to a differentiable loss](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/getting_started/first_steps.md),
-then [Choose parameters and check the result](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/choosing_parameters/guide.md).
-These tutorials explain the concepts with code and figures together. The
+Start with [From two point clouds to a differentiable loss](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/getting_started/first_steps.ipynb),
+then [Choose parameters and check the result](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/choosing_parameters/guide.ipynb).
+These Jupyter notebooks explain the concepts with code and reference figures together. Install
+`pip install -e ".[notebooks]"` from a clone and open `jupyter lab` to run the code cells on a CUDA GPU. The
 [case gallery](https://github.com/ot-triton-lab/flash-sinkhorn/blob/main/examples/README.md) contains thirteen runnable
 examples, from 10,000 points to millions: gradient flows, transport and attribute transfer, relaxed marginals,
 labelled datasets, embeddings, batches, multiscale solves, Hessian-vector products and semi-discrete transport.
