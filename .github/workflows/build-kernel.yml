@@ -33,6 +33,8 @@ jobs:
             git clone "${{ github.server_url }}/${{ github.repository }}" kernel
             cd kernel
             git checkout "${{ github.sha }}"
-            nix run github:huggingface/kernels#kernel-builder -- build-and-upload \
+            builder_ref=github:huggingface/kernels/c212e38db005a95ef905858bdeca7a3c15b607a4
+            nix run "$builder_ref#kernel-builder" -- check-config
+            nix run "$builder_ref#kernel-builder" -- build-and-upload \
               --max-jobs 4 \
               --cores 8

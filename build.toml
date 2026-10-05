@@ -1,7 +1,7 @@
 [general]
 name = "flash-sinkhorn"
 version = 1
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["cuda"]
 upstream = "https://github.com/ot-triton-lab/flash-sinkhorn"
