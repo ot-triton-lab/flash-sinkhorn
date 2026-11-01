@@ -14,6 +14,7 @@ separation between Triton kernel code and solver logic.
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Optional, Sequence, Tuple
 
@@ -28,14 +29,95 @@ from .kernels.sinkhorn_flashstyle_sqeuclid import (
 )
 
 
-def _warn_not_converged(threshold: float, n_iters: int, checked: bool) -> None:
-    """A threshold was given and the potential-change test never passed, so convergence to it is not confirmed."""
-    if checked:
+STOP_MODES = ("potential_linf", "marginal_l1", "marginal_linf")
+
+
+def _check_stop_mode(stop_mode: str, rho_x: Optional[float], rho_y: Optional[float],
+                     threshold: Optional[float]) -> bool:
+    """Reject unknown stopping rules, and marginal rules on unbalanced problems (their marginals are not targets).
+
+    Returns whether ``stop_mode`` is a marginal rule.
+    """
+    if stop_mode not in STOP_MODES:
+        raise ValueError(f"stop_mode must be one of {STOP_MODES}, got {stop_mode!r}.")
+    marginal = stop_mode != "potential_linf"
+    if marginal and (rho_x is not None or rho_y is not None):
+        raise ValueError(f'stop_mode="{stop_mode}" requires balanced OT (reach, reach_x, reach_y and rho unset).')
+    if marginal and threshold is None:
+        warnings.warn(f'stop_mode="{stop_mode}" has no effect without threshold; all iterations run.',
+                      UserWarning, stacklevel=3)
+    return marginal
+
+
+def _check_marginal_inputs(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+                           alpha: torch.Tensor, beta: torch.Tensor, eps: float, allow_tf32: bool,
+                           threshold: float, stop_mode: str) -> None:
+    """Validate the weights a marginal rule measures against, and warn when threshold is below its rounding floor.
+
+    The residual is that of the plan as the kernels compute it. Shifted potentials carry a rounding error of about
+    ``u * (max alpha + max beta)``, with ``u`` the unit roundoff of the cost products (TF32 unless the coordinates
+    are already TF32 values, fp32 otherwise), so the residual is not resolved below about that error over ``eps``.
+    """
+    from .multiscale._preprocess import round_to_tf32
+
+    for name, w in (("a", a), ("b", b)):
+        if w.numel() == 0 or not bool((torch.isfinite(w) & (w >= 0)).all()):
+            raise ValueError(f'stop_mode="{stop_mode}" needs nonempty, finite, nonnegative weights {name}.')
+    tf32_inexact = allow_tf32 and any(bool((round_to_tf32(t) != t).any()) for t in (x, y))
+    unit = 2.0 ** -11 if tf32_inexact else 2.0 ** -24
+    floor = unit * float(alpha.abs().max() + beta.abs().max()) / eps
+    if stop_mode == "marginal_linf":
+        floor *= float(torch.maximum(a.max(), b.max()))
+    if threshold < floor:
+        warnings.warn(
+            f'Sinkhorn: threshold={threshold:g} is below the estimated rounding floor {floor:.1e} of the '
+            f'{stop_mode} residual for these inputs, so the stopping test may pass or fail spuriously. Center the '
+            f'coordinates, round them to TF32 or use allow_tf32=False, or raise threshold.',
+            RuntimeWarning, stacklevel=3)
+
+
+def _marginal_residual(weights: torch.Tensor, before: torch.Tensor, after: torch.Tensor, eps: float,
+                       stop_mode: str) -> torch.Tensor:
+    """Residual of one marginal from a single c-transform, with no extra c-transform launch.
+
+    If ``after`` is the c-transform of the other potential that replaces ``before``, the plan built from ``before``
+    and that other potential has marginal ``weights * exp((before - after) / eps)`` on this side. Returns the L1
+    norm or the max norm of its difference from ``weights``; zero-weight entries, whose potentials may be
+    infinite, are left out.
+    """
+    residual = before.to(torch.float64, copy=True).sub_(after).div_(eps).expm1_().mul_(weights)
+    residual = residual.masked_fill_(~(weights > 0), 0).abs_()
+    return residual.sum() if stop_mode == "marginal_l1" else residual.max()
+
+
+def _marginal_error(stop_mode: str, eps: float, *sides) -> float:
+    """``||P 1 - a||_1 + ||P^T 1 - b||_1`` for "marginal_l1", the largest entry error for "marginal_linf".
+
+    Each side is ``(weights, before, after)`` as in :func:`_marginal_residual`; a side left out is exact.
+    """
+    norms = torch.stack([_marginal_residual(w, before, after, eps, stop_mode) for w, before, after in sides])
+    error = float(norms.sum() if stop_mode == "marginal_l1" else norms.max())
+    if not math.isfinite(error):
+        warnings.warn(f"Sinkhorn: the {stop_mode} residual is {error}; the potentials have diverged.",
+                      RuntimeWarning, stacklevel=3)
+    return error
+
+
+def _warn_not_converged(threshold: float, n_iters: int, checked: bool, stop_mode: str, symmetric: bool) -> None:
+    """A threshold was given and the stopping test never passed, so convergence to it is not confirmed."""
+    test = "potential-change" if stop_mode == "potential_linf" else stop_mode
+    if checked and stop_mode != "potential_linf":
+        why = f"was not reached by the {stop_mode} residual within {n_iters} updates."
+    elif checked:
         why = (f"was not confirmed by the potential-change checks within {n_iters} updates. These checks are not a "
                "marginal-residual certificate.")
-    else:
-        why = ("was not confirmed: no potential-change comparison ran at the target eps. Use more fixed-eps "
+    elif symmetric:
+        why = (f"was not confirmed: no {test} check ran at the target eps. Use more fixed-eps "
                "iterations, or repeat the target eps in eps_list; n_iters does not extend an automatic schedule.")
+    else:
+        first = " from the second update on" if stop_mode != "potential_linf" else ""
+        why = (f"was not confirmed: no {test} check ran within {n_iters} updates. Checks run every check_every "
+               f"updates{first}; raise n_iters or lower check_every.")
     warnings.warn(f"Sinkhorn: convergence to threshold={threshold:g} {why}", RuntimeWarning, stacklevel=3)
 
 
@@ -82,6 +164,7 @@ def sinkhorn_flashstyle_alternating(
     autotune: bool = True,
     threshold: Optional[float] = None,
     check_every: int = 5,
+    stop_mode: str = "potential_linf",
     return_n_iters: bool = False,
     ott_convention: bool = False,
     # Adaptive padding: mask convergence check to unpadded slices
@@ -116,6 +199,11 @@ def sinkhorn_flashstyle_alternating(
         autotune: Enable kernel autotuning
         threshold: Early stopping threshold (None = no early stopping)
         check_every: Check convergence every N iterations
+        stop_mode: Stopping rule used with threshold.
+            "potential_linf" (default): max(|df|, |dg|) between checks < threshold.
+            "marginal_l1": ||P 1 - a||_1 + ||P^T 1 - b||_1 <= threshold.
+            "marginal_linf": max(||P 1 - a||_inf, ||P^T 1 - b||_inf) <= threshold.
+            Marginal rules need balanced OT and measure the plan before the last update; see API.md, Early Stopping.
         return_n_iters: If True, also return number of iterations used
         ott_convention: If True, return potentials in OTT convention where
             log marginals are absorbed into potentials:
@@ -165,6 +253,7 @@ def sinkhorn_flashstyle_alternating(
         if rho_y is not None:
             raise ValueError("Specify either rho_y or reach_y, not both.")
         rho_y = reach_y ** 2
+    marginal_stop = _check_stop_mode(stop_mode, rho_x, rho_y, threshold)
 
     # Semi-unbalanced OT: damping_f = 1/(1+eps/rho_x), damping_g = 1/(1+eps/rho_y)
     # CRITICAL FIX: rho_x controls SOURCE marginal → damps f potential
@@ -183,6 +272,11 @@ def sinkhorn_flashstyle_alternating(
     # This ensures TF32 parity with the fused kernel
     alpha = cost_scale * (x_f32 ** 2).sum(dim=1)  # [n]
     beta = cost_scale * (y_f32 ** 2).sum(dim=1)   # [m]
+    if marginal_stop and threshold is not None:
+        _no = n_orig if n_orig is not None else len(a)
+        _mo = m_orig if m_orig is not None else len(b)
+        _check_marginal_inputs(x_f32[:_no], y_f32[:_mo], a[:_no], b[:_mo], alpha[:_no], beta[:_mo], eps,
+                               allow_tf32, threshold, stop_mode)
     log_a = log_weights(a)  # [n], for g-update (NOT scaled by eps for fused kernel)
     log_b = log_weights(b)  # [m], for f-update (NOT scaled by eps for fused kernel)
     # For OTT convention (non-fused kernel), we need scaled versions
@@ -194,8 +288,9 @@ def sinkhorn_flashstyle_alternating(
     f_hat = -alpha.clone()
     g_hat = -beta.clone()
 
-    prev_f_hat = f_hat.clone() if threshold is not None else None
-    prev_g_hat = g_hat.clone() if threshold is not None else None
+    track_change = threshold is not None and not marginal_stop
+    prev_f_hat = f_hat.clone() if track_change else None
+    prev_g_hat = g_hat.clone() if track_change else None
 
     n_iters_used = 0
     converged = False  # set when the threshold test passes
@@ -234,6 +329,7 @@ def sinkhorn_flashstyle_alternating(
             # g-update FIRST: g = δ + (-ε * LSE_i[y·x^T * coord_scale/ε + f̂/ε]) + β
             # g_ott = delta + g_hat_lse + beta
             # We store g_hat = g_ott - beta, so g_hat = delta + g_hat_lse
+            g_prev = g_hat
             v = f_hat / eps  # Use current f_hat (shifted)
             g_hat_lse = flashsinkhorn_lse(
                 y_f32, x_f32, v, eps, cost_scale=cost_scale,
@@ -260,11 +356,18 @@ def sinkhorn_flashstyle_alternating(
 
             n_iters_used += 1
 
-            # Early stopping check
-            if threshold is not None and (i + 1) % check_every == 0:
+            # Early stopping check (marginal rules skip update 1: the initial potentials are not c-transforms)
+            if threshold is not None and (i + 1) % check_every == 0 and (not marginal_stop or i > 0):
                 checked = True
                 _no = n_orig if n_orig is not None else len(f_hat)
                 _mo = m_orig if m_orig is not None else len(g_hat)
+                if marginal_stop:
+                    # The previous f was a full update against the previous g, so that plan's row marginal is
+                    # exact and its column marginal comes from this g update.
+                    if _marginal_error(stop_mode, eps, (b[:_mo], g_prev[:_mo], g_hat[:_mo])) <= threshold:
+                        converged = True
+                        break
+                    continue
                 f_change = (f_hat[:_no] - prev_f_hat[:_no]).abs().max().item()
                 g_change = (g_hat[:_mo] - prev_g_hat[:_mo]).abs().max().item()
                 if max(f_change, g_change) < threshold:
@@ -284,6 +387,7 @@ def sinkhorn_flashstyle_alternating(
         # This eliminates Python kernel launch overhead.
         # =================================================================
         for i in range(n_iters):
+            f_prev = f_hat
             # f-update: f̂ = -ε * LSE_j[x·y^T * coord_scale/ε + ĝ/ε + log(b)]
             # FUSED: kernel computes bias = g_hat/eps + log_b in SRAM
             f_hat = flashsinkhorn_lse_fused(
@@ -313,10 +417,17 @@ def sinkhorn_flashstyle_alternating(
             n_iters_used += 1
 
             # Early stopping check
-            if threshold is not None and (i + 1) % check_every == 0:
+            if threshold is not None and (i + 1) % check_every == 0 and (not marginal_stop or i > 0):
                 checked = True
                 _no = n_orig if n_orig is not None else len(f_hat)
                 _mo = m_orig if m_orig is not None else len(g_hat)
+                if marginal_stop:
+                    # The previous g was a full update against the previous f, so that plan's column marginal is
+                    # exact and its row marginal comes from this f update.
+                    if _marginal_error(stop_mode, eps, (a[:_no], f_prev[:_no], f_hat[:_no])) <= threshold:
+                        converged = True
+                        break
+                    continue
                 f_change = (f_hat[:_no] - prev_f_hat[:_no]).abs().max().item()
                 g_change = (g_hat[:_mo] - prev_g_hat[:_mo]).abs().max().item()
                 if max(f_change, g_change) < threshold:
@@ -326,7 +437,7 @@ def sinkhorn_flashstyle_alternating(
                 prev_g_hat.copy_(g_hat)
 
     if threshold is not None and not converged:
-        _warn_not_converged(threshold, n_iters_used, checked)
+        _warn_not_converged(threshold, n_iters_used, checked, stop_mode, symmetric=False)
     # Convert back to standard potentials
     if ott_convention:
         # OTT convention: potentials do NOT include ||x||², ||y||²
@@ -373,6 +484,7 @@ def sinkhorn_flashstyle_symmetric(
     fused: Optional[bool] = None,
     threshold: Optional[float] = None,
     check_every: int = 5,
+    stop_mode: str = "potential_linf",
     return_n_iters: bool = False,
     return_prelast: bool = False,
     # Warm-start parameters (standard potentials, not shifted)
@@ -419,8 +531,14 @@ def sinkhorn_flashstyle_symmetric(
         fused: None (default) = fused when n < 30000 or the label term is active, separate otherwise.
                True = always fused (1 kernel launch per iteration).
                False = always separate (2 launches per iteration); rejects an active label term.
-        threshold: Early stopping threshold
+        threshold: Early stopping threshold (None = no early stopping)
         check_every: Check convergence every N iterations
+        stop_mode: Stopping rule used with threshold.
+            "potential_linf" (default): max(|df|, |dg|) between checks < threshold.
+            "marginal_l1": ||P 1 - a||_1 + ||P^T 1 - b||_1 <= threshold.
+            "marginal_linf": max(||P 1 - a||_inf, ||P^T 1 - b||_inf) <= threshold.
+            Every rule is checked only at the final eps. Marginal rules need balanced OT and measure the plan
+            before the last update (and extrapolation); see API.md, Early Stopping.
         return_n_iters: If True, also return number of iterations used
         return_prelast: If True, also return pre-extrapolation potentials
         f_init: Initial f potential for warm-start (standard form, not shifted)
@@ -478,6 +596,7 @@ def sinkhorn_flashstyle_symmetric(
         if rho_y is not None:
             raise ValueError("Specify either rho_y or reach_y, not both.")
         rho_y = reach_y ** 2
+    marginal_stop = _check_stop_mode(stop_mode, rho_x, rho_y, threshold)
 
     # Build epsilon schedule
     if eps_list is None:
@@ -514,6 +633,11 @@ def sinkhorn_flashstyle_symmetric(
     beta = norm_scale * (y_f32 ** 2).sum(dim=1)
     log_a = log_weights(a)
     log_b = log_weights(b)
+    if marginal_stop and threshold is not None:
+        _no = n_orig if n_orig is not None else len(a)
+        _mo = m_orig if m_orig is not None else len(b)
+        _check_marginal_inputs(x_f32[:_no], y_f32[:_mo], a[:_no], b[:_mo], alpha[:_no], beta[:_mo], eps_list[-1],
+                               allow_tf32, threshold, stop_mode)
 
     # Work entirely in shifted potential space: f̂ = f - α, ĝ = g - β
     # Standard init is f=0, g=0, so f̂ = 0 - α = -α, ĝ = 0 - β = -β
@@ -568,6 +692,7 @@ def sinkhorn_flashstyle_symmetric(
             damp_g = dampening(step_eps, rho_y)  # FIXED: rho_y → g
 
             # FUSED: both f and g updates in ONE kernel launch
+            f_before, g_before = f_hat, g_hat
             f_hat, g_hat = flashsinkhorn_symmetric_step(
                 x_f32, y_f32, f_hat, g_hat, log_a, log_b, step_eps,
                 cost_scale=cost_scale, alpha=0.5, damping_f=damp_f, damping_g=damp_g,
@@ -589,7 +714,19 @@ def sinkhorn_flashstyle_symmetric(
 
             # Early stopping check (in shifted space)
             if threshold is not None and step_eps == eps_list[-1] and (iter_idx + 1) % check_every == 0:
-                if prev_f is None:
+                if marginal_stop:
+                    checked = True
+                    _no = n_orig if n_orig is not None else len(f_hat)
+                    _mo = m_orig if m_orig is not None else len(g_hat)
+                    # Balanced and alpha=0.5, so each candidate is 2 * new - old: the c-transforms of the plan
+                    # built from (f_before, g_before), whose two marginals they give.
+                    error = _marginal_error(stop_mode, step_eps,
+                                            (a[:_no], f_before[:_no], 2.0 * f_hat[:_no] - f_before[:_no]),
+                                            (b[:_mo], g_before[:_mo], 2.0 * g_hat[:_mo] - g_before[:_mo]))
+                    if error <= threshold:
+                        converged = True
+                        break
+                elif prev_f is None:
                     prev_f = f_hat.clone()
                     prev_g = g_hat.clone()
                 else:
@@ -721,7 +858,17 @@ def sinkhorn_flashstyle_symmetric(
 
             # Early stopping check
             if threshold is not None and step_eps == eps_list[-1] and (iter_idx + 1) % check_every == 0:
-                if prev_f is None:
+                if marginal_stop:
+                    checked = True
+                    _no = n_orig if n_orig is not None else len(f_hat)
+                    _mo = m_orig if m_orig is not None else len(g_hat)
+                    # The candidates are the c-transforms of the plan built from (f_old, g_old).
+                    error = _marginal_error(stop_mode, step_eps, (a[:_no], f_old[:_no], f_cand[:_no]),
+                                            (b[:_mo], g_old[:_mo], g_cand[:_mo]))
+                    if error <= threshold:
+                        converged = True
+                        break
+                elif prev_f is None:
                     prev_f = f_hat.clone()
                     prev_g = g_hat.clone()
                 else:
@@ -775,7 +922,7 @@ def sinkhorn_flashstyle_symmetric(
             n_iters_used += 1
 
     if threshold is not None and not converged:
-        _warn_not_converged(threshold, n_iters_used, checked)
+        _warn_not_converged(threshold, n_iters_used, checked, stop_mode, symmetric=True)
     # Convert to standard potentials at the end
     f = f_hat + alpha
     g = g_hat + beta

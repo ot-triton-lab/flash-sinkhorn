@@ -78,6 +78,7 @@ class _SinkhornConfig:
     # Adaptive padding: original unpadded sizes for masked early stopping
     n_orig: Optional[int] = None
     m_orig: Optional[int] = None
+    stop_mode: str = "potential_linf"
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +351,7 @@ class _SinkhornCostFn(torch.autograd.Function):
                 use_exp2=config.use_exp2,
                 threshold=config.threshold,
                 check_every=config.inner_iterations,
+                stop_mode=config.stop_mode,
                 n_orig=config.n_orig,
                 m_orig=config.m_orig,
             )
@@ -404,6 +406,7 @@ class _SinkhornCostFn(torch.autograd.Function):
                 lambda_y=config.lambda_y,
                 threshold=config.threshold,
                 check_every=config.inner_iterations,
+                stop_mode=config.stop_mode,
                 n_orig=config.n_orig,
                 m_orig=config.m_orig,
             )
@@ -433,6 +436,7 @@ class _SinkhornCostFn(torch.autograd.Function):
                 lambda_y=config.lambda_y,
                 threshold=config.threshold,
                 check_every=config.inner_iterations,
+                stop_mode=config.stop_mode,
                 n_orig=config.n_orig,
                 m_orig=config.m_orig,
             )
