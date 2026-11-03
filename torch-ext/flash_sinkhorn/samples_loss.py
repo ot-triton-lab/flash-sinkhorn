@@ -22,6 +22,7 @@ from .kernels.sinkhorn_flashstyle_sqeuclid import (
     sinkhorn_flashstyle_alternating,
     sinkhorn_flashstyle_symmetric,
 )
+from .sinkhorn_solvers import _check_stop_mode
 
 #: Default target marginal residual of backend="multiscale".
 MULTISCALE_DEFAULT_TOL = 5e-3
@@ -362,6 +363,8 @@ class SamplesLoss(torch.nn.Module):
     - Gradients are computed analytically (no backprop through Sinkhorn iterations),
       matching GeomLoss's `last_extrapolation` convention.
     - `potentials=True` returns (f, g) without autograd support.
+    - With `threshold` set, `stop_mode` ("potential_linf" default, "marginal_l1",
+      "marginal_linf") picks the stopping test; see API.md, Early Stopping.
     """
 
     def __init__(
@@ -409,6 +412,7 @@ class SamplesLoss(torch.nn.Module):
         # Early stopping parameters (like OTT-JAX)
         threshold: Optional[float] = None,
         inner_iterations: int = 10,
+        stop_mode: str = "potential_linf",
         # Deprecated: FlashSinkhorn is now the only backend
         use_flashstyle: Optional[bool] = None,
         # Adaptive padding for variable-size OT
@@ -464,6 +468,8 @@ class SamplesLoss(torch.nn.Module):
                                eps_list=eps_list, n_iters=n_iters, diameter=diameter,
                                pad_to_multiple=pad_to_multiple)
             given = [name for name, value in unsupported.items() if value is not None]
+            if stop_mode != "potential_linf":
+                given.append("stop_mode")
             given += [name for name, value in (("allow_tf32=False", allow_tf32),
                                                ("truncate_tf32=False", truncate_tf32),
                                                ("use_epsilon_scaling=False", use_epsilon_scaling))
@@ -547,6 +553,8 @@ class SamplesLoss(torch.nn.Module):
 
         self.threshold = None if threshold is None else float(threshold)
         self.inner_iterations = int(inner_iterations)
+        _check_stop_mode(stop_mode, self.rho_x, self.rho_y, self.threshold)
+        self.stop_mode = stop_mode
 
         # Adaptive padding
         self.pad_to_multiple = None if pad_to_multiple is None else int(pad_to_multiple)
@@ -590,6 +598,7 @@ class SamplesLoss(torch.nn.Module):
             lambda_y=self.lambda_y,
             threshold=self.threshold,
             inner_iterations=self.inner_iterations,
+            stop_mode=self.stop_mode,
         )
 
     def _eps_list_for_inputs(self, x: torch.Tensor, y: torch.Tensor) -> Sequence[float]:
@@ -797,6 +806,7 @@ class SamplesLoss(torch.nn.Module):
                             use_exp2=self.use_exp2,
                             threshold=self.threshold,
                             check_every=self.inner_iterations,
+                            stop_mode=self.stop_mode,
                             n_orig=n_orig if should_pad else None,
                             m_orig=m_orig if should_pad else None,
                         )
@@ -827,6 +837,7 @@ class SamplesLoss(torch.nn.Module):
                         lambda_y=self.lambda_y,
                         threshold=self.threshold,
                         check_every=self.inner_iterations,
+                        stop_mode=self.stop_mode,
                         n_orig=n_orig if should_pad else None,
                         m_orig=m_orig if should_pad else None,
                     )
@@ -865,6 +876,7 @@ class SamplesLoss(torch.nn.Module):
                     use_exp2=self.use_exp2,
                     threshold=self.threshold,
                     check_every=self.inner_iterations,
+                    stop_mode=self.stop_mode,
                     n_orig=n_orig if should_pad else None,
                     m_orig=m_orig if should_pad else None,
                 )
@@ -891,6 +903,7 @@ class SamplesLoss(torch.nn.Module):
                     lambda_y=self.lambda_y,
                     threshold=self.threshold,
                     check_every=self.inner_iterations,
+                    stop_mode=self.stop_mode,
                     n_orig=n_orig if should_pad else None,
                     m_orig=m_orig if should_pad else None,
                 )

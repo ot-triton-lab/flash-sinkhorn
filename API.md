@@ -110,23 +110,49 @@ Debiasing and relaxed marginals are supported.
 
 #### Early Stopping (like OTT-JAX)
 
-A potential-change threshold can stop the iterations early; the time it saves depends on the problem and on the
+A potential-change or marginal-residual threshold can stop the iterations early; the time it saves depends on the problem and on the
 cost of the checks.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `threshold` | `float` or `None` | `None` | Convergence threshold. `None` = run all iterations. |
 | `inner_iterations` | `int` | `10` | Check convergence every N iterations. |
+| `stop_mode` | `str` | `"potential_linf"` | `"potential_linf"`, `"marginal_l1"`, or `"marginal_linf"`. Marginal modes require balanced OT. |
 
 **How it works:**
-- Tracks the potential change `max(|f_new - f_old|, |g_new - g_old|)` between checks every `inner_iterations`
+- By default, tracks the potential change `max(|f_new - f_old|, |g_new - g_old|)` between checks every `inner_iterations`
   updates, and stops when it falls below `threshold`
-- The symmetric backend checks only at the target epsilon and needs two checks there, so under epsilon scaling the
-  threshold acts only where the schedule repeats the target epsilon (`eps_list`); the alternating backend checks
-  from the start
-- Each check costs a max-reduction and a host synchronization
+- The symmetric backend checks only at the target epsilon, in every mode, so under epsilon scaling the threshold acts
+  only where the schedule repeats the target epsilon (`eps_list`); the default potential-change mode needs two
+  checks there. The alternating backend checks from the start (the marginal modes from its second update)
+- Each check costs a reduction and a host synchronization
 - A threshold that is never met gives a `RuntimeWarning`. The change test is not a marginal-residual certificate.
 - `threshold=None` runs all iterations
+
+For balanced OT, `stop_mode="marginal_l1"` tests
+`sum(abs(P @ 1 - a)) + sum(abs(P.T @ 1 - b)) <= threshold`, and `"marginal_linf"` the largest
+absolute entry error of either marginal (not divided by its target weight). The `marginal_l1` sum adds the
+two norms, unlike the `tol` of `backend="multiscale"`, which takes their maximum.
+
+- The residual comes from the c-transforms the update already computes, so a check adds no c-transform
+  evaluation. It measures the plan of the potentials before that update; the returned update and the optional
+  final extrapolation can change it.
+- It is the residual of the plan as the kernels compute it, in fp32 or TF32. When `threshold` is below the
+  estimated rounding floor for the inputs, the solver warns: the floor grows with the coordinate norms, active
+  label-cost magnitude `max(abs(cost_scale * lambda_y * W))`, and `1/eps`. Unrounded TF32 dot products increase
+  the coordinate contribution; centering the clouds, rounding them to TF32 (as `SamplesLoss` does by default)
+  or `allow_tf32=False` lowers that contribution. Label costs retain an FP32 rounding contribution independently
+  of these coordinate settings.
+- The residual does not bound the OT objective gap.
+- The dense solvers and `SamplesLoss` reject the marginal modes for unbalanced OT and `backend="multiscale"`.
+  Without `threshold` they have no effect and warn.
+
+```python
+loss = SamplesLoss(
+    backend="alternating", eps=0.05, use_epsilon_scaling=False, n_iters=5000,
+    threshold=1e-4, stop_mode="marginal_l1", inner_iterations=10,
+)
+```
 
 Some problems stay unconverged at large iteration counts. On clustered 2-D clouds of 400 points at a fixed
 `eps=0.09` with `n_iters=50000`, the symmetric backend's `OT(a, b)` solve still had a marginal residual of 2.1e-4 and
@@ -376,7 +402,7 @@ warns and returns its best candidate with `accepted=False`.
 
 - It solves the **centered, TF32-rounded** clouds at `eps = blur**2`, with its own
   annealing schedule. `allow_tf32=False`, `truncate_tf32=False`, `use_epsilon_scaling=False`, `eps`, `eps_list`,
-  `n_iters`, `diameter`, `threshold`, `pad_to_multiple`, `reach*` and label costs are
+  `n_iters`, `diameter`, `threshold`, a marginal `stop_mode`, `pad_to_multiple`, `reach*` and label costs are
   rejected; `scaling`, `last_extrapolation`, `inner_iterations`, `use_exp2`, the kernel
   launch options and the `hvp_*` options do not apply.
 - Balanced OT only; `debias` and `half_cost` are supported, and each of the three debiased
