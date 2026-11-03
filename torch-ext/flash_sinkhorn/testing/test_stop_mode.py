@@ -213,6 +213,36 @@ def test_threshold_below_rounding_floor_warns():
                                       threshold=1e-4, stop_mode="marginal_l1")
 
 
+@pytest.mark.parametrize("mode", ["marginal_l1", "marginal_linf"])
+@pytest.mark.parametrize("cost_scale,lambda_y,threshold,expect_warning", [
+    pytest.param(1.0, 1.0, 1e-6, True, id="active-label-cost"),
+    pytest.param(1.0, 1.0, 1e-3, False, id="loose-threshold"),
+    pytest.param(1.0, 0.0, 1e-6, False, id="disabled-label-cost"),
+    pytest.param(0.01, 1.0, 1e-6, False, id="scaled-cost"),
+    pytest.param(1.0, 0.01, 1e-6, False, id="scaled-label-cost"),
+    pytest.param(0.1, 0.1, 1e-6, False, id="scaled-both"),
+])
+def test_label_cost_rounding_floor(mode, cost_scale, lambda_y, threshold, expect_warning):
+    # Zero coordinate norms must not hide the precision limit of an active label cost.
+    x = torch.zeros(2, 1, device="cuda")
+    y = torch.zeros_like(x)
+    a = torch.tensor([0.25, 0.75], device="cuda")
+    b = torch.tensor([0.75, 0.25], device="cuda")
+    labels = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    label_cost = torch.tensor([[0.0, 100.0], [100.0, 0.0]], device="cuda")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sinkhorn_flashstyle_symmetric(
+            x, y, a, b, eps_list=[0.1] * 2, allow_tf32=False, autotune=False,
+            last_extrapolation=False, threshold=threshold, check_every=1, stop_mode=mode,
+            cost_scale=cost_scale, label_x=labels, label_y=labels,
+            label_cost_matrix=label_cost, lambda_y=lambda_y,
+        )
+    precision_warnings = [w for w in caught if "rounding floor" in str(w.message)]
+    assert len(precision_warnings) == int(expect_warning)
+    assert all(issubclass(w.category, RuntimeWarning) for w in precision_warnings)
+
+
 def test_tf32_rounded_coordinates_have_fp32_floor():
     x, y, a, b = _problem()
     x, y = round_to_tf32(x), round_to_tf32(y)

@@ -51,12 +51,14 @@ def _check_stop_mode(stop_mode: str, rho_x: Optional[float], rho_y: Optional[flo
 
 def _check_marginal_inputs(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
                            alpha: torch.Tensor, beta: torch.Tensor, eps: float, allow_tf32: bool,
-                           threshold: float, stop_mode: str) -> None:
+                           threshold: float, stop_mode: str, *, label_cost_bound: float = 0.0) -> None:
     """Validate the weights a marginal rule measures against, and warn when threshold is below its rounding floor.
 
     The residual is that of the plan as the kernels compute it. Shifted potentials carry a rounding error of about
     ``u * (max alpha + max beta)``, with ``u`` the unit roundoff of the cost products (TF32 unless the coordinates
-    are already TF32 values, fp32 otherwise), so the residual is not resolved below about that error over ``eps``.
+    are already TF32 values, fp32 otherwise). Active label costs add fp32 rounding proportional to
+    ``max(abs(cost_scale * lambda_y * W))`` independently of the coordinate precision. The residual is not
+    resolved below about the combined error over ``eps``.
     """
     from .multiscale._preprocess import round_to_tf32
 
@@ -65,14 +67,16 @@ def _check_marginal_inputs(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b:
             raise ValueError(f'stop_mode="{stop_mode}" needs nonempty, finite, nonnegative weights {name}.')
     tf32_inexact = allow_tf32 and any(bool((round_to_tf32(t) != t).any()) for t in (x, y))
     unit = 2.0 ** -11 if tf32_inexact else 2.0 ** -24
-    floor = unit * float(alpha.abs().max() + beta.abs().max()) / eps
+    floor = (unit * float(alpha.abs().max() + beta.abs().max()) + 2.0 ** -24 * label_cost_bound) / eps
     if stop_mode == "marginal_linf":
         floor *= float(torch.maximum(a.max(), b.max()))
     if threshold < floor:
+        label_note = (" Label-cost rounding is unaffected by coordinate centering or TF32 settings."
+                      if label_cost_bound else "")
         warnings.warn(
             f'Sinkhorn: threshold={threshold:g} is below the estimated rounding floor {floor:.1e} of the '
             f'{stop_mode} residual for these inputs, so the stopping test may pass or fail spuriously. Center the '
-            f'coordinates, round them to TF32 or use allow_tf32=False, or raise threshold.',
+            f'coordinates, round them to TF32 or use allow_tf32=False, or raise threshold.{label_note}',
             RuntimeWarning, stacklevel=3)
 
 
@@ -636,8 +640,10 @@ def sinkhorn_flashstyle_symmetric(
     if marginal_stop and threshold is not None:
         _no = n_orig if n_orig is not None else len(a)
         _mo = m_orig if m_orig is not None else len(b)
+        label_cost_bound = (abs(cost_scale * lambda_y) * float(label_cost_matrix.float().abs().max())
+                            if label_active else 0.0)
         _check_marginal_inputs(x_f32[:_no], y_f32[:_mo], a[:_no], b[:_mo], alpha[:_no], beta[:_mo], eps_list[-1],
-                               allow_tf32, threshold, stop_mode)
+                               allow_tf32, threshold, stop_mode, label_cost_bound=label_cost_bound)
 
     # Work entirely in shifted potential space: f̂ = f - α, ĝ = g - β
     # Standard init is f=0, g=0, so f̂ = 0 - α = -α, ĝ = 0 - β = -β

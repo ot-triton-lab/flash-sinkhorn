@@ -138,9 +138,11 @@ two norms, unlike the `tol` of `backend="multiscale"`, which takes their maximum
   evaluation. It measures the plan of the potentials before that update; the returned update and the optional
   final extrapolation can change it.
 - It is the residual of the plan as the kernels compute it, in fp32 or TF32. When `threshold` is below the
-  estimated rounding floor for the inputs, the solver warns: the floor grows with the coordinate norms and with
-  `1/eps`, and is larger when TF32 multiplies unrounded coordinates. Centering the clouds, rounding them to TF32
-  (as `SamplesLoss` does by default) or `allow_tf32=False` lowers it.
+  estimated rounding floor for the inputs, the solver warns: the floor grows with the coordinate norms, active
+  label-cost magnitude `max(abs(cost_scale * lambda_y * W))`, and `1/eps`. Unrounded TF32 dot products increase
+  the coordinate contribution; centering the clouds, rounding them to TF32 (as `SamplesLoss` does by default)
+  or `allow_tf32=False` lowers that contribution. Label costs retain an FP32 rounding contribution independently
+  of these coordinate settings.
 - The residual does not bound the OT objective gap.
 - The dense solvers and `SamplesLoss` reject the marginal modes for unbalanced OT and `backend="multiscale"`.
   Without `threshold` they have no effect and warn.
